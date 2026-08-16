@@ -137,7 +137,6 @@ func TestLoadConfigOrBootstrapValidation(t *testing.T) {
 		want string
 	}{
 		{name: "server key required", env: map[string]string{"OPENCODE2API_ZEN_KEYS": "zen"}, want: "server_keys must contain at least one local key"},
-		{name: "upstream key required", env: map[string]string{"OPENCODE2API_SERVER_KEYS": "local"}, want: "zen_keys or go_keys must contain at least one upstream key"},
 		{name: "WebUI password required", env: map[string]string{"OPENCODE2API_SERVER_KEYS": "local", "OPENCODE2API_GO_KEYS": "go"}, want: "webui.password is required for first-time setup"},
 	}
 	for _, test := range tests {
@@ -153,19 +152,42 @@ func TestLoadConfigOrBootstrapValidation(t *testing.T) {
 		})
 	}
 
-	t.Run("disabled WebUI does not require password", func(t *testing.T) {
+	t.Run("disabled WebUI and no upstream keys", func(t *testing.T) {
 		clearBootstrapEnvironment(t)
 		t.Setenv("OPENCODE2API_SERVER_KEYS", "local")
-		t.Setenv("OPENCODE2API_GO_KEYS", "go")
 		t.Setenv("OPENCODE2API_WEBUI_ENABLED", "false")
-		cfg, err := LoadConfigOrBootstrap(filepath.Join(t.TempDir(), "config.json"))
+		path := filepath.Join(t.TempDir(), "config.json")
+		cfg, err := LoadConfigOrBootstrap(path)
 		if err != nil {
 			t.Fatalf("LoadConfigOrBootstrap() error = %v", err)
 		}
 		if cfg.WebUI.Enabled {
 			t.Fatal("WebUI.Enabled = true, want false")
 		}
+		if len(cfg.ZenKeys) != 0 || len(cfg.GoKeys) != 0 {
+			t.Fatalf("bootstrap persisted unexpected upstream keys: Zen=%#v Go=%#v", cfg.ZenKeys, cfg.GoKeys)
+		}
+		loaded, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("persisted anonymous config cannot be loaded: %v", err)
+		}
+		if len(loaded.ZenKeys) != 0 || len(loaded.GoKeys) != 0 {
+			t.Fatalf("persisted config contains an anonymous sentinel: Zen=%#v Go=%#v", loaded.ZenKeys, loaded.GoKeys)
+		}
 	})
+}
+
+func TestNormalizeConfigAllowsNoUpstreamKeys(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.ZenKeys = nil
+	cfg.GoKeys = nil
+	normalized, err := NormalizeConfig(filepath.Join(t.TempDir(), "config.json"), cfg)
+	if err != nil {
+		t.Fatalf("NormalizeConfig() error = %v", err)
+	}
+	if len(normalized.ZenKeys) != 0 || len(normalized.GoKeys) != 0 {
+		t.Fatalf("NormalizeConfig() added persisted upstream keys: Zen=%#v Go=%#v", normalized.ZenKeys, normalized.GoKeys)
+	}
 }
 
 func validTestConfig() Config {

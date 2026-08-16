@@ -71,7 +71,14 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		return nil, err
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	zenNodes, err := newNodePool(cfg.ZenKeys, transports, cooldown)
+	zenKeys := cfg.ZenKeys
+	if len(zenKeys) == 0 {
+		// Anonymous Zen is a runtime-only node. Keep cfg.ZenKeys empty so health
+		// counts, management views, and persisted configuration describe real
+		// credentials only.
+		zenKeys = []string{""}
+	}
+	zenNodes, err := newNodePool(zenKeys, transports, cooldown)
 	if err != nil {
 		return nil, fmt.Errorf("zen node pool: %w", err)
 	}
@@ -103,7 +110,7 @@ func (g *Gateway) Handler() http.Handler {
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	models := g.catalog.Snapshot()
 	proxyTotal, proxyHealthy := g.transports.healthCounts()
-	zenKeys, goKeys := g.zenNodes.Len(), g.goNodes.Len()
+	zenKeys, goKeys := len(g.cfg.ZenKeys), len(g.cfg.GoKeys)
 	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
 
 	modelStatus := "ready"
@@ -123,7 +130,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			issues = append(issues, "model_catalog_stale")
 		}
 	}
-	if zenKeys+goKeys == 0 {
+	if g.zenNodes.Len()+g.goNodes.Len() == 0 {
 		issues = append(issues, "no_upstream_keys")
 	}
 	if proxyHealthy == 0 {
@@ -193,9 +200,6 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 	models := g.catalog.List()
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		if !supportedModel(model) {
-			continue
-		}
 		data = append(data, map[string]any{"id": model, "object": "model", "created": now, "owned_by": "opencode"})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
@@ -222,11 +226,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
 			return
 		}
-		if !supportedModel(model) {
-			writeAPIError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
-			return
-		}
-		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0)
+		route, err := g.catalog.Route(model, g.zenNodes.Len() > 0, g.goNodes.Len() > 0)
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 			return
@@ -352,12 +352,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		req.Header.Set("x-opencode-session", ids.Session)
 		req.Header.Set("x-opencode-request", ids.Request)
 		req.Header.Set("x-opencode-project", ids.Project)
-		if route.Protocol == ProtocolAnthropic {
-			req.Header.Set("x-api-key", node.key)
-			req.Header.Set("anthropic-version", "2023-06-01")
-		} else {
-			req.Header.Set("Authorization", "Bearer "+node.key)
-		}
+		setUpstreamAuthentication(req, route.Protocol, node.key)
 		attemptStarted := time.Now()
 		resp, err := proxy.client.Do(req)
 		attemptDuration := time.Since(attemptStarted)
@@ -368,7 +363,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
 		if err == nil && resp.StatusCode/100 == 2 {
 			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "proxy", redactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", upstreamKeyID(node.key), "proxy", redactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil
 		}
 		// Request-shape errors are deterministic and must be returned to the
@@ -376,7 +371,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		// throttling, server, and transport failures remain retryable.
 		if err == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
 			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", upstreamKeyID(node.key), "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil
 		}
 		if proxyFailed {
@@ -389,15 +384,28 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
-			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds(), "error", err)
+			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", upstreamKeyID(node.key), "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds(), "error", err)
 		} else {
-			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", upstreamKeyID(node.key), "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
 		}
 	}
 	if lastResponse != nil {
 		return lastResponse, nil
 	}
 	return nil, lastErr
+}
+
+func setUpstreamAuthentication(req *http.Request, protocol Protocol, key string) {
+	if protocol == ProtocolAnthropic {
+		if key != "" {
+			req.Header.Set("x-api-key", key)
+		}
+		req.Header.Set("anthropic-version", "2023-06-01")
+		return
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
 }
 
 // syncProxyResult updates proxy health from real traffic. Only timeouts and

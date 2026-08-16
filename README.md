@@ -8,7 +8,7 @@
 - 支持 Anthropic Messages API
 - 支持普通响应和 SSE 流式响应
 - 支持文本、图片、thinking/reasoning、工具定义、工具调用和工具结果转换
-- 分离配置 Zen key 池与 Zen Go key 池
+- 分离配置 Zen key 池与 Zen Go key 池；没有 Zen key 时自动使用匿名 Zen
 - 模型同时存在于两个上游时按 `prefer` 配置优先使用 Go 或 Zen（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
 - 支持从文本文件读取代理池，并与配置内的代理合并、去重
@@ -67,7 +67,7 @@ go build -o opencode2api ./
 git clone https://github.com/jasonxu114514/opencode2api.git
 cd opencode2api
 cp .env.example .env
-# 编辑 .env，替换本地 API key、Zen/Go key 和 WebUI 密码
+# 编辑 .env，替换本地 API key 和 WebUI 密码；Zen/Go key 按需填写
 docker compose up -d
 ```
 
@@ -104,13 +104,15 @@ docker compose up -d
 | 环境变量 | 要求与格式 |
 | --- | --- |
 | `OPENCODE2API_SERVER_KEYS` | 必需。本服务对客户端校验的本地 API key；可填 JSON 字符串数组，或逗号/换行分隔列表。 |
-| `OPENCODE2API_ZEN_KEYS` | Zen 上游 key 列表，与 `OPENCODE2API_GO_KEYS` 至少一项非空。格式同上。 |
-| `OPENCODE2API_GO_KEYS` | Zen Go 上游 key 列表，与 `OPENCODE2API_ZEN_KEYS` 至少一项非空。格式同上。 |
+| `OPENCODE2API_ZEN_KEYS` | 可选。Zen 上游 key 列表；格式同上。留空时使用匿名 Zen。 |
+| `OPENCODE2API_GO_KEYS` | 可选。Zen Go 上游 key 列表；格式同上。 |
 | `OPENCODE2API_WEBUI_USERNAME` | 可选，默认 `admin`。 |
 | `OPENCODE2API_WEBUI_PASSWORD` | WebUI 启用时必需，至少 10 个字符。首次启动后会转换为 Argon2id 哈希。 |
 | `OPENCODE2API_WEBUI_ENABLED` | 可选，默认 `true`；设为 `false` 可关闭 WebUI。 |
 
 这些初始化变量只在配置文件不存在时读取。一旦 `/var/lib/opencode2api/config.json` 已生成，配置文件始终优先；更改初始化变量不会覆盖 WebUI 保存的内容。需要重新初始化时，应先明确备份并删除持久卷中的配置文件。
+
+`OPENCODE2API_ZEN_KEYS` 和 `OPENCODE2API_GO_KEYS` 可以同时留空。此时服务匿名读取 Zen `/v1/models` 返回的完整目录，不按 `-free` 或其他模型名称筛选；模型是否允许匿名推理由上游决定，需要付费或鉴权的模型可能直接返回上游的 HTTP `401` 或 `403`。
 
 部署后的同一个公开域名同时提供 WebUI `/`、管理接口 `/api/`、模型与推理接口 `/v1/`，健康检查路径是 `/healthz`。启动后模型目录首次刷新完成前，`/healthz` 短暂返回 `503 starting` 属于正常状态；进程已在监听，刷新成功后会变为 `200 ok`。
 
@@ -128,7 +130,7 @@ cp config.example.json config.json
 {
   "listen": "127.0.0.1:8080",
   "server_keys": ["change-this-local-key"],
-  "zen_keys": ["sk-your-zen-key"],
+  "zen_keys": [],
   "go_keys": [],
   "prefer": "go",
   "proxyfile": "",
@@ -173,13 +175,13 @@ cp config.example.json config.json
 | --- | --- |
 | `listen` | 本地监听地址。默认建议使用 `127.0.0.1:8080`，避免服务直接暴露到公网。 |
 | `server_keys` | 调用本代理时使用的本地 API key 列表。它们只用于本地鉴权，不会发送给 OpenCode。 |
-| `zen_keys` | OpenCode Zen API key 池。允许配置多个 key。 |
-| `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
+| `zen_keys` | 可选的 OpenCode Zen API key 池。允许配置多个 key；空数组表示使用匿名 Zen。 |
+| `go_keys` | 可选的 OpenCode Zen Go API key 池；没有 Go key 时使用空数组。 |
 | `prefer` | 模型同时存在于 Zen 与 Go 时优先使用的上游，值为 `go` 或 `zen`，默认 `go`。仅存在于某一池时不受影响。 |
 | `proxyfile` | 可选代理池文件路径。相对路径以 `config.json` 所在目录为基准；内容会追加到 `proxies` 并去重。 |
 | `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
 
-`server_keys` 至少需要一个值；`zen_keys` 和 `go_keys` 至少有一个池不能为空。
+`server_keys` 至少需要一个值。`zen_keys` 和 `go_keys` 都可以为空；这只省略上游凭据，不会放宽调用本代理所需的本地 API key 或 WebUI 鉴权。
 
 ### key 与代理分配规则
 
@@ -255,7 +257,7 @@ socks5://127.0.0.1:1080  # 备用代理
 }
 ```
 
-模型同时存在于 Zen 与 Go 时按 `prefer` 配置选择：值为 `go` 时优先 Go，值为 `zen` 时优先 Zen（默认 `go`）。仅存在于某一池时才使用该池的 key。
+模型同时存在于 Zen 与 Go 时按 `prefer` 配置选择：值为 `go` 时优先 Go，值为 `zen` 时优先 Zen（默认 `go`）。仅存在于某一池时使用该池。没有 Zen key 时，服务仍匿名读取并完整返回 Zen `/v1/models` 的目录，不根据 `-free` 后缀、提供商或其他模型名称筛选。具体模型是否允许匿名推理由上游响应决定；需要付费或鉴权的模型可能返回上游 HTTP `401` 或 `403`。
 
 ### Thinking 工具历史兼容
 

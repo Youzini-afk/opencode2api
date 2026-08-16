@@ -232,6 +232,7 @@ type KeyStatus struct {
 	ProxyIndex    int        `json:"proxy_index"`
 	Failures      uint32     `json:"failures"`
 	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+	Anonymous     bool       `json:"anonymous,omitempty"`
 }
 
 type ProxyStatus struct {
@@ -274,7 +275,8 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 	result := make([]KeyStatus, 0, len(pool.nodes))
 	for _, node := range pool.nodes {
-		status := KeyStatus{ID: secretFingerprint(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load()}
+		anonymous := node.key == ""
+		status := KeyStatus{ID: upstreamKeyID(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load(), Anonymous: anonymous}
 		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value
@@ -282,6 +284,13 @@ func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 		result = append(result, status)
 	}
 	return result
+}
+
+func upstreamKeyID(value string) string {
+	if value == "" {
+		return "anonymous"
+	}
+	return secretFingerprint(value)
 }
 
 func secretFingerprint(value string) string {

@@ -95,7 +95,7 @@ func (c *modelCatalog) CopyState(source *modelCatalog) {
 	c.mu.Unlock()
 }
 
-func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys bool) (modelRoute, error) {
+func (c *modelCatalog) Route(model string, hasZenNodes, hasGoNodes bool) (modelRoute, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	protocol := c.protocols[model]
@@ -104,24 +104,24 @@ func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys bool) (modelRou
 	}
 	// When a model exists on both tiers, honor the configured priority.
 	preferGo := c.prefer == TierGo
-	if preferGo && c.goModels[model] && hasGoKeys {
+	if preferGo && c.goModels[model] && hasGoNodes {
 		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
 	}
-	if c.zen[model] && hasZenKeys {
+	if c.zen[model] && hasZenNodes {
 		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
 	}
-	if !preferGo && c.goModels[model] && hasGoKeys {
+	if !preferGo && c.goModels[model] && hasGoNodes {
 		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
 	}
 	// Model discovery can temporarily fail. Honor the configured priority.
 	if len(c.zen) == 0 && len(c.goModels) == 0 {
-		if preferGo && hasGoKeys {
+		if preferGo && hasGoNodes {
 			return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
 		}
-		if hasZenKeys {
+		if hasZenNodes {
 			return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
 		}
-		if hasGoKeys {
+		if hasGoNodes {
 			return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
 		}
 	}
@@ -156,17 +156,11 @@ func (c *modelCatalog) Snapshot() modelCatalogSnapshot {
 	for model := range c.goModels {
 		seen[model] = true
 	}
-	exposed := 0
-	for model := range seen {
-		if supportedModel(model) {
-			exposed++
-		}
-	}
 	return modelCatalogSnapshot{
 		Zen:       len(c.zen),
 		Go:        len(c.goModels),
 		Total:     len(seen),
-		Exposed:   exposed,
+		Exposed:   len(seen),
 		UpdatedAt: c.updatedAt,
 	}
 }
@@ -194,11 +188,6 @@ func inferProtocol(model string) Protocol {
 	return ProtocolChat
 }
 
-func supportedModel(model string) bool {
-	m := strings.ToLower(model)
-	return !strings.HasPrefix(m, "gemini-")
-}
-
 type modelsResponse struct {
 	Data []struct {
 		ID string `json:"id"`
@@ -210,7 +199,9 @@ func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
 	req.Header.Set("User-Agent", opencodeUserAgent())
 	req.Header.Set("x-opencode-client", "cli")
 	resp, err := client.Do(req)
