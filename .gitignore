@@ -1,4 +1,5 @@
 .key
+.env
 config.json
 opencode/
 opencode2api

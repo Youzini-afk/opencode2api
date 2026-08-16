@@ -18,7 +18,7 @@
 - 代理失败后自动迁移绑定，key 失败后进行短时冷却
 - 根据真实上游流量识别代理故障，并每 15 分钟通过 Cloudflare trace 并行复查异常代理
 - 为不同会话生成不同的 OpenCode 会话 ID，并支持 `x-opencode-session`、`x-session-id` 和 `conversation-id` 显式指定会话
-- 内置独立端口 WebUI，可管理配置、查看运行指标、key/proxy 状态与实时日志
+- 内置 WebUI，可与 API 共用一个端口，也可配置为独立端口
 - WebUI 使用账号密码、服务端 session、HttpOnly Cookie、CSRF 与登录限速保护
 - WebUI 保存后原子写入配置并热切换 Gateway；无效配置不会影响当前流量
 - stdout 输出结构化 JSON 日志，最近事件与一小时滚动指标保存在有限内存中
@@ -39,7 +39,7 @@
 
 ## WebUI
 
-示例配置会在独立的 `8081` 端口启动管理界面：
+直接运行二进制并使用示例配置时，管理界面位于独立的 `8081` 端口：
 
 ```text
 http://服务器地址:8081
@@ -48,6 +48,8 @@ http://服务器地址:8081
 首次账号为 `admin`，密码来自 `webui.password`。服务第一次成功启动时会使用 Argon2id 将密码转换为带盐哈希，写入 `webui.password_hash`，并从配置中删除明文密码。请在首次登录后立即修改示例密码。
 
 WebUI 可查看最近一小时的请求率、成功率、状态码与延迟分位，监控活跃请求/流、模型、key 冷却和 proxy 健康状态；实时日志通过 SSE 推送。监控和最近日志仅保存在内存，服务重启后清空，stdout 日志仍可由 Docker 或日志平台收集。
+
+Docker 与 Zeabur 默认让 WebUI 和 API 共用同一个公开端口：`/` 和 `/api/` 由 WebUI 处理，`/v1/` 和 `/healthz` 由 API 处理。只有显式把 `LISTEN_ADDRESS` 与 `WEBUI_LISTEN_ADDRESS` 设置为不同地址时，才会启动两个监听端口。
 
 ## 编译
 
@@ -59,32 +61,58 @@ go build -o opencode2api ./
 
 ## Docker Compose 部署
 
-服务器安装 Docker 与 Docker Compose 后，可以在克隆项目后直接启动：
+服务器安装 Docker 与 Docker Compose 后，可以在克隆项目后直接构建并启动。推荐先创建 `.env`，其中只放自己的密钥，不要提交到仓库：
 
 ```bash
 git clone https://github.com/jasonxu114514/opencode2api.git
 cd opencode2api
+cp .env.example .env
+# 编辑 .env，替换本地 API key、Zen/Go key 和 WebUI 密码
 docker compose up -d
-```
-
-
-```bash
-cp config.example.json config.json
-# 编辑 server_keys、zen_keys/go_keys，并修改 webui.password
-docker compose restart
 ```
 
 ```bash
 curl http://127.0.0.1:8080/healthz
-# 浏览器打开 http://127.0.0.1:8081
+# 浏览器打开 http://127.0.0.1:8080
 docker compose logs -f
 ```
 
-如需修改宿主机端口：
+容器只公开一个端口，宿主机端口可单独修改：
 
 ```bash
-OPENCODE2API_PORT=18080 OPENCODE2API_WEBUI_PORT=18081 docker compose up -d
+OPENCODE2API_PORT=18080 docker compose up -d
 ```
+
+Compose 只挂载 `opencode2api-state` 状态卷，不再挂载源码或 Go 编译缓存。首次启动会把环境变量生成的配置写到卷内的 `/var/lib/opencode2api/config.json`；以后即使 `.env` 仍存在，也会优先读取该文件，因此 WebUI 修改不会在重启时被环境变量覆盖。
+
+如果继续手工维护已有 `config.json`，可以在首次 `up` 前将其放进同一个命名卷，然后正常启动：
+
+```bash
+docker compose build
+docker compose run --rm --no-deps -v "./config.json:/tmp/config.json:ro" --entrypoint sh opencode2api -c 'cp /tmp/config.json /var/lib/opencode2api/config.json'
+docker compose up -d
+```
+
+如果配置文件不存在且没有设置任何 `OPENCODE2API_*` 初始化变量，容器会报错退出，不会使用公开的示例 API key 或管理密码启动。复制并填写 `.env.example`，或者先导入已有 `config.json` 后再启动。
+
+## Zeabur Git 部署
+
+1. 在 GitHub fork 本仓库，在 Zeabur 从该 fork 创建 Git 服务；仓库根目录的 `Dockerfile` 会在构建阶段编译二进制，运行时镜像不含 Go 工具链，也不需要源码挂载。
+2. 为服务配置下面的初始化环境变量。Zeabur 注入的 `PORT` 会被自动用于 API 与 WebUI 的同一个 `0.0.0.0:<PORT>` 监听地址，不需要手工设置 `PORT`、`LISTEN_ADDRESS` 或 `WEBUI_LISTEN_ADDRESS`。
+3. 如需在重新部署后保留 WebUI 修改的配置，为服务挂载持久卷到 `/var/lib/opencode2api`。没有持久卷也能启动，但容器文件系统重建后会再次从环境变量初始化。
+
+| 环境变量 | 要求与格式 |
+| --- | --- |
+| `OPENCODE2API_SERVER_KEYS` | 必需。本服务对客户端校验的本地 API key；可填 JSON 字符串数组，或逗号/换行分隔列表。 |
+| `OPENCODE2API_ZEN_KEYS` | Zen 上游 key 列表，与 `OPENCODE2API_GO_KEYS` 至少一项非空。格式同上。 |
+| `OPENCODE2API_GO_KEYS` | Zen Go 上游 key 列表，与 `OPENCODE2API_ZEN_KEYS` 至少一项非空。格式同上。 |
+| `OPENCODE2API_WEBUI_USERNAME` | 可选，默认 `admin`。 |
+| `OPENCODE2API_WEBUI_PASSWORD` | WebUI 启用时必需，至少 10 个字符。首次启动后会转换为 Argon2id 哈希。 |
+| `OPENCODE2API_WEBUI_ENABLED` | 可选，默认 `true`；设为 `false` 可关闭 WebUI。 |
+
+这些初始化变量只在配置文件不存在时读取。一旦 `/var/lib/opencode2api/config.json` 已生成，配置文件始终优先；更改初始化变量不会覆盖 WebUI 保存的内容。需要重新初始化时，应先明确备份并删除持久卷中的配置文件。
+
+部署后的同一个公开域名同时提供 WebUI `/`、管理接口 `/api/`、模型与推理接口 `/v1/`，健康检查路径是 `/healthz`。启动后模型目录首次刷新完成前，`/healthz` 短暂返回 `503 starting` 属于正常状态；进程已在监听，刷新成功后会变为 `200 ok`。
 
 ## 配置
 
@@ -257,8 +285,8 @@ socks5://127.0.0.1:1080  # 备用代理
 
 | 字段 | 含义 |
 | --- | --- |
-| `webui.enabled` | 是否在独立端口启动管理服务。旧配置未包含该段时默认关闭。 |
-| `webui.listen` | 管理服务监听地址，示例为 `0.0.0.0:8081`。 |
+| `webui.enabled` | 是否启动管理服务。旧配置未包含该段时默认关闭。 |
+| `webui.listen` | 管理服务监听地址；与顶层 `listen` 完全相同时共用一个 HTTP server，不同时使用独立端口。示例为 `0.0.0.0:8081`。 |
 | `webui.username` | 单一管理员账号。 |
 | `webui.password` | 仅用于首次初始化的明文密码，至少 10 个字符；启动后自动删除。 |
 | `webui.password_hash` | 自动生成的 Argon2id 哈希，不应手动编辑，也不会由 WebUI API 返回。 |

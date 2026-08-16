@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -19,7 +20,7 @@ func main() {
 	webListen := flag.String("web-listen", "", "override the configured WebUI listen address")
 	flag.Parse()
 
-	cfg, err := LoadConfig(*configPath)
+	cfg, err := LoadConfigOrBootstrap(*configPath)
 	if err != nil {
 		slog.Error("configuration error", "error", err)
 		os.Exit(1)
@@ -47,29 +48,54 @@ func main() {
 	}
 	defer manager.Shutdown()
 
-	apiServer := &http.Server{
-		Addr: cfg.Listen, Handler: manager.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
-	}
-	servers := []*http.Server{apiServer}
-	go serveHTTP(cancel, logger, apiServer, "api")
-
+	var adminHandler http.Handler
 	if cfg.WebUI.Enabled {
 		admin := NewAdminServer(manager, monitor, hub, logger)
-		webServer := &http.Server{
-			Addr: cfg.WebUI.Listen, Handler: admin.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
-		}
-		servers = append(servers, webServer)
-		go serveHTTP(cancel, logger, webServer, "webui")
+		adminHandler = admin.Handler()
+	}
+	services := configuredHTTPServices(cfg, manager.Handler(), adminHandler)
+	for _, service := range services {
+		go serveHTTP(cancel, logger, service.server, service.component)
 	}
 
 	<-ctx.Done()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
-	for _, server := range servers {
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Error("graceful shutdown failed", "component", "server", "event", "shutdown_failed", "address", server.Addr, "error", err)
+	for _, service := range services {
+		if err := service.server.Shutdown(shutdownCtx); err != nil {
+			logger.Error("graceful shutdown failed", "component", "server", "event", "shutdown_failed", "address", service.server.Addr, "error", err)
 		}
 	}
+}
+
+type httpService struct {
+	server    *http.Server
+	component string
+}
+
+func configuredHTTPServices(cfg Config, apiHandler, adminHandler http.Handler) []httpService {
+	if cfg.WebUI.Enabled && cfg.Listen == cfg.WebUI.Listen {
+		return []httpService{{server: newHTTPServer(cfg.Listen, singlePortHandler(apiHandler, adminHandler)), component: "api+webui"}}
+	}
+	services := []httpService{{server: newHTTPServer(cfg.Listen, apiHandler), component: "api"}}
+	if cfg.WebUI.Enabled {
+		services = append(services, httpService{server: newHTTPServer(cfg.WebUI.Listen, adminHandler), component: "webui"})
+	}
+	return services
+}
+
+func newHTTPServer(address string, handler http.Handler) *http.Server {
+	return &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second}
+}
+
+func singlePortHandler(apiHandler, adminHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/v1/") {
+			apiHandler.ServeHTTP(w, r)
+			return
+		}
+		adminHandler.ServeHTTP(w, r)
+	})
 }
 
 func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server, component string) {
