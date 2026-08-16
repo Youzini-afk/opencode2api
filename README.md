@@ -139,6 +139,12 @@ cp config.example.json config.json
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go"
   },
+  "fingerprint": {
+    "versions": [
+      "1.18.18", "1.18.17", "1.18.16", "1.18.15", "1.18.14", "1.18.13",
+      "1.18.12", "1.18.11", "1.18.10", "1.18.9", "1.18.8", "1.18.7"
+    ]
+  },
   "retry": {
     "max_attempts": 3,
     "timeout_seconds": 300
@@ -241,6 +247,14 @@ socks5://127.0.0.1:1080  # 备用代理
 
 流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
 
+### `fingerprint`
+
+| 字段 | 含义 |
+| --- | --- |
+| `fingerprint.versions` | OpenCode CLI 版本池。每项必须是三段数字版本号；空白会清理，重复项只保留一次，且至少保留一项。 |
+
+代理会按会话通过 rendezvous（最高随机权重）哈希稳定选择一个版本，并发送严格的 `User-Agent: opencode/<version>`。相同会话和版本池在热重载后不会漂移；增删版本时只重新分配受该版本影响的部分会话。
+
 ### `models`
 
 | 字段 | 含义 |
@@ -300,16 +314,18 @@ WebUI 中普通配置响应只包含 key 尾码/指纹及脱敏 proxy。需要�
 
 WebUI 保存时先解析并验证完整候选配置、创建新的连接池和 Gateway，然后写入临时文件、保留 `config.json.bak` 并替换 `config.json`，最后原子切换新请求使用的运行实例。写入或初始化失败时旧实例继续工作；切换前已开始的请求不会中断。
 
-keys、proxy、上游、重试、模型、性能、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化，原有注释不会保留。
+keys、proxy、上游、指纹版本池、重试、模型、性能、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化，原有注释不会保留。
 
 
 ## 会话 ID
 
 代理会为上游添加 OpenCode 使用的 `User-Agent`、`x-opencode-client`、`x-opencode-session`、`x-opencode-request` 和 `x-opencode-project` 请求头。
 
+- `User-Agent` 严格为 `opencode/<version>`；版本从 `fingerprint.versions` 按会话稳定选取，不包含运行本服务的操作系统或 Go 版本。
 - 每个请求使用不同的 `x-opencode-request`，同一次请求的重试保持不变。
 - 优先使用客户端提供的 `x-opencode-session`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成会话 ID。
 - 没有显式会话标识时，使用第一条用户消息生成稳定会话 ID，使同一段多轮对话保持一致。
+- `x-opencode-project` 默认由会话稳定生成 40 位小写 SHA-1；显式传入 `global` 或合法的 40 位小写 SHA-1 时原样保留，其他非空值会稳定规范化为 SHA-1。
 - 如果两个独立会话的第一条消息完全相同，建议由客户端发送不同的 `x-session-id`，以确保两个会话严格分离。
 
 ## 致谢

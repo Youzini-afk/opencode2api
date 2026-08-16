@@ -132,6 +132,7 @@ func cloneConfig(cfg Config) Config {
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
 	cfg.Proxies = append([]string(nil), cfg.Proxies...)
+	cfg.Fingerprint.Versions = append([]string(nil), cfg.Fingerprint.Versions...)
 	cfg.effectiveProxies = append([]string(nil), cfg.effectiveProxies...)
 	if cfg.Models.Protocols != nil {
 		protocols := make(map[string]string, len(cfg.Models.Protocols))

@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestFetchModelsAuthenticationAndCompleteCatalog(t *testing.T) {
 	wantModels := []string{"paid-model", "mimo-v2.5-free", "gemini-2.5-pro"}
+	identity := deriveInternalRequestIDs("models-test", "req_models_test", defaultOpenCodeVersions)
 	tests := []struct {
 		name              string
 		key               string
@@ -25,15 +28,17 @@ func TestFetchModelsAuthenticationAndCompleteCatalog(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			var authorization string
+			var headers http.Header
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				authorization = r.Header.Get("Authorization")
+				headers = r.Header.Clone()
 				writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []map[string]string{
 					{"id": wantModels[0]}, {"id": wantModels[1]}, {"id": wantModels[2]},
 				}})
 			}))
 			defer server.Close()
 
-			models, status, err := fetchModels(context.Background(), server.Client(), server.URL, test.key)
+			models, status, err := fetchModels(context.Background(), server.Client(), server.URL, test.key, identity)
 			if err != nil {
 				t.Fatalf("fetchModels() error = %v", err)
 			}
@@ -42,6 +47,12 @@ func TestFetchModelsAuthenticationAndCompleteCatalog(t *testing.T) {
 			}
 			if authorization != test.wantAuthorization {
 				t.Fatalf("Authorization = %q, want %q", authorization, test.wantAuthorization)
+			}
+			assertOpenCodeHeaders(t, headers, identity)
+			for _, name := range openCodeIdentityHeaderNames {
+				if test.key != "" && strings.Contains(headers.Get(name), test.key) {
+					t.Fatalf("%s leaked the upstream key", name)
+				}
 			}
 			if !reflect.DeepEqual(models, wantModels) {
 				t.Fatalf("fetchModels() = %#v, want complete upstream catalog %#v", models, wantModels)
@@ -252,6 +263,208 @@ func TestAnonymousZenHealthAndKeyStatus(t *testing.T) {
 	}
 	if len(resources.Proxies) != 1 || resources.Proxies[0].ZenKeys != 1 {
 		t.Fatalf("anonymous proxy binding missing: %#v", resources.Proxies)
+	}
+}
+
+func TestInferenceIdentityIsStableAcrossRetryAndSession(t *testing.T) {
+	var captured []http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = append(captured, r.Header.Clone())
+		if len(captured) == 1 {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{"message": "retry"}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "response", "choices": []any{}})
+	}))
+	defer server.Close()
+
+	cfg := gatewayTestConfig(server.URL)
+	cfg.Retry.MaxAttempts = 2
+	gateway := newGatewayForTest(t, cfg)
+	request := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"paid-model","messages":[]}`))
+		r.Header.Set("x-session-id", "stable-retry-session")
+		return r
+	}
+	firstRecorder := httptest.NewRecorder()
+	gateway.handleInference(ProtocolChat)(firstRecorder, request())
+	if firstRecorder.Code != http.StatusOK || len(captured) != 2 {
+		t.Fatalf("first inference status = %d, attempts = %d, body = %s", firstRecorder.Code, len(captured), firstRecorder.Body.String())
+	}
+	assertOpenCodeIdentityHeadersEqual(t, captured[0], captured[1])
+	if got := captured[0].Get("User-Agent"); !strings.HasPrefix(got, "opencode/") || strings.ContainsAny(got, " ()\t\r\n") {
+		t.Fatalf("retry User-Agent = %q", got)
+	}
+	if got := captured[0].Get("x-opencode-project"); !gitProjectIDPattern.MatchString(got) {
+		t.Fatalf("retry project ID = %q, want lowercase SHA-1", got)
+	}
+
+	secondRecorder := httptest.NewRecorder()
+	gateway.handleInference(ProtocolChat)(secondRecorder, request())
+	if secondRecorder.Code != http.StatusOK || len(captured) != 3 {
+		t.Fatalf("second inference status = %d, total attempts = %d", secondRecorder.Code, len(captured))
+	}
+	for _, name := range []string{"User-Agent", "x-opencode-client", "x-opencode-session", "x-opencode-project"} {
+		if captured[2].Get(name) != captured[0].Get(name) {
+			t.Fatalf("same session changed %s: %q != %q", name, captured[2].Get(name), captured[0].Get(name))
+		}
+	}
+	if captured[2].Get("x-opencode-request") == captured[0].Get("x-opencode-request") {
+		t.Fatalf("new inference reused x-opencode-request %q", captured[2].Get("x-opencode-request"))
+	}
+}
+
+func TestModelRefreshRetryUsesCompleteStableAnonymousIdentity(t *testing.T) {
+	var captured []http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = append(captured, r.Header.Clone())
+		if len(captured) == 1 {
+			http.Error(w, "retry", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": []map[string]string{{"id": "model-a"}}})
+	}))
+	defer server.Close()
+
+	cfg := gatewayTestConfig(server.URL)
+	cfg.Retry.MaxAttempts = 2
+	gateway := newGatewayForTest(t, cfg)
+	models := gateway.refreshTier(context.Background(), TierZen, server.URL, gateway.zenNodes, "req_refresh_round")
+	if !reflect.DeepEqual(models, []string{"model-a"}) || len(captured) != 2 {
+		t.Fatalf("refresh models = %#v, attempts = %d", models, len(captured))
+	}
+	assertOpenCodeIdentityHeadersEqual(t, captured[0], captured[1])
+	if got := captured[0].Get("x-opencode-request"); got != "req_refresh_round" {
+		t.Fatalf("refresh request ID = %q", got)
+	}
+	if got := captured[0].Get("Authorization"); got != "" {
+		t.Fatalf("anonymous refresh sent Authorization = %q", got)
+	}
+	for _, name := range openCodeIdentityHeaderNames {
+		if captured[0].Get(name) == "" {
+			t.Fatalf("anonymous refresh omitted %s", name)
+		}
+	}
+}
+
+func TestParallelModelRefreshUsesDistinctRequestIDs(t *testing.T) {
+	type capturedRequest struct {
+		tier      Tier
+		requestID string
+	}
+	captured := make(chan capturedRequest, 2)
+	server := func(tier Tier) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			captured <- capturedRequest{tier: tier, requestID: r.Header.Get("x-opencode-request")}
+			writeJSON(w, http.StatusOK, map[string]any{"data": []map[string]string{{"id": string(tier) + "-model"}}})
+		}))
+	}
+	zenServer := server(TierZen)
+	defer zenServer.Close()
+	goServer := server(TierGo)
+	defer goServer.Close()
+
+	cfg := gatewayTestConfig(zenServer.URL)
+	cfg.Upstream.Go = goServer.URL
+	cfg.GoKeys = []string{"go-key"}
+	cfg.Models.RefreshSeconds = 3600
+	gateway := newGatewayForTest(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gateway.StartModelRefresh(ctx)
+
+	requestIDs := make(map[Tier]string, 2)
+	for len(requestIDs) < 2 {
+		select {
+		case request := <-captured:
+			requestIDs[request.tier] = request.requestID
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for parallel model refreshes: %#v", requestIDs)
+		}
+	}
+	cancel()
+	if requestIDs[TierZen] == "" || requestIDs[TierGo] == "" {
+		t.Fatalf("parallel refresh omitted request ID: %#v", requestIDs)
+	}
+	if requestIDs[TierZen] == requestIDs[TierGo] {
+		t.Fatalf("independent Zen and Go refreshes shared request ID %q", requestIDs[TierZen])
+	}
+}
+
+func TestModelRefreshIdentityDoesNotExposeKey(t *testing.T) {
+	const key = "refresh-key-must-not-leak"
+	var captured http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Clone()
+		writeJSON(w, http.StatusOK, map[string]any{"data": []map[string]string{{"id": "model-a"}}})
+	}))
+	defer server.Close()
+	cfg := gatewayTestConfig(server.URL)
+	cfg.ZenKeys = []string{key}
+	gateway := newGatewayForTest(t, cfg)
+	gateway.refreshTier(context.Background(), TierZen, server.URL, gateway.zenNodes, "req_keyed_refresh")
+	if got := captured.Get("Authorization"); got != "Bearer "+key {
+		t.Fatalf("keyed refresh Authorization = %q", got)
+	}
+	for _, name := range openCodeIdentityHeaderNames {
+		if strings.Contains(captured.Get(name), key) {
+			t.Fatalf("%s leaked the upstream key", name)
+		}
+	}
+}
+
+func TestProxyHealthCheckUsesLegalDefaultUserAgent(t *testing.T) {
+	var userAgent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userAgent = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	pool, err := newTransportPool([]string{"direct"}, defaultConfig().Performance, time.Second)
+	if err != nil {
+		t.Fatalf("newTransportPool() error = %v", err)
+	}
+	proxy := pool.items[0]
+	proxy.checking.Store(true)
+	result := pool.checkClaimedProxy(context.Background(), proxy, server.URL, time.Second)
+	if result.err != nil {
+		t.Fatalf("health check error = %v", result.err)
+	}
+	if userAgent != "opencode/1.18.18" {
+		t.Fatalf("health check User-Agent = %q", userAgent)
+	}
+}
+
+var openCodeIdentityHeaderNames = []string{
+	"User-Agent",
+	"x-opencode-client",
+	"x-opencode-session",
+	"x-opencode-request",
+	"x-opencode-project",
+}
+
+func assertOpenCodeHeaders(t *testing.T, headers http.Header, want requestIDs) {
+	t.Helper()
+	wantValues := map[string]string{
+		"User-Agent":         want.UserAgent,
+		"x-opencode-client":  "cli",
+		"x-opencode-session": want.Session,
+		"x-opencode-request": want.Request,
+		"x-opencode-project": want.Project,
+	}
+	for name, value := range wantValues {
+		if got := headers.Get(name); got != value {
+			t.Fatalf("%s = %q, want %q", name, got, value)
+		}
+	}
+}
+
+func assertOpenCodeIdentityHeadersEqual(t *testing.T, first, second http.Header) {
+	t.Helper()
+	for _, name := range openCodeIdentityHeaderNames {
+		if first.Get(name) != second.Get(name) {
+			t.Fatalf("retry changed %s: %q != %q", name, first.Get(name), second.Get(name))
+		}
 	}
 }
 

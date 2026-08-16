@@ -248,7 +248,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, "request contains unsupported JSON values", "invalid_request_error", "")
 			return
 		}
-		ids := deriveRequestIDs(r, payload)
+		ids := deriveRequestIDs(r, payload, g.cfg.Fingerprint.Versions)
 		if meta != nil {
 			meta.Request = ids.Request
 		}
@@ -347,11 +347,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("User-Agent", opencodeUserAgent())
-		req.Header.Set("x-opencode-client", "cli")
-		req.Header.Set("x-opencode-session", ids.Session)
-		req.Header.Set("x-opencode-request", ids.Request)
-		req.Header.Set("x-opencode-project", ids.Project)
+		setOpenCodeIdentityHeaders(req, ids)
 		setUpstreamAuthentication(req, route.Protocol, node.key)
 		attemptStarted := time.Now()
 		resp, err := proxy.client.Do(req)
@@ -536,10 +532,18 @@ func protocolPath(protocol Protocol) string {
 func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	refresh := func() {
 		var zen, goModels []string
+		zenRequestID := randomID("req", 16)
+		goRequestID := randomID("req", 16)
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); zen = g.refreshTier(ctx, g.cfg.Upstream.Zen, g.zenNodes) }()
-		go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
+		go func() {
+			defer wg.Done()
+			zen = g.refreshTier(ctx, TierZen, g.cfg.Upstream.Zen, g.zenNodes, zenRequestID)
+		}()
+		go func() {
+			defer wg.Done()
+			goModels = g.refreshTier(ctx, TierGo, g.cfg.Upstream.Go, g.goNodes, goRequestID)
+		}()
 		wg.Wait()
 		if zen != nil || goModels != nil {
 			g.catalog.Replace(zen, goModels)
@@ -561,12 +565,20 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	}()
 }
 
-func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool) []string {
+func (g *Gateway) refreshTier(ctx context.Context, tier Tier, base string, nodes *nodePool, requestID string) []string {
 	cursor := nodes.Cursor()
+	node := cursor.Next()
+	if node == nil {
+		return nil
+	}
+	identitySignal := strings.Join([]string{strings.TrimRight(base, "/"), string(tier), internalKeySignal(node.key)}, "\x00")
+	ids := deriveInternalRequestIDs(identitySignal, requestID, g.cfg.Fingerprint.Versions)
 	for attempt := 0; attempt < g.cfg.Retry.MaxAttempts; attempt++ {
-		node := cursor.Next()
-		if node == nil {
-			return nil
+		if attempt > 0 {
+			node = cursor.Next()
+			if node == nil {
+				return nil
+			}
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		proxy := nodes.Proxy(node)
@@ -574,7 +586,7 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool)
 			cancel()
 			return nil
 		}
-		models, status, err := fetchModels(refreshCtx, proxy.client, base, node.key)
+		models, status, err := fetchModels(refreshCtx, proxy.client, base, node.key, ids)
 		g.syncProxyResult(refreshCtx, proxy, status, err)
 		cancel()
 		if err == nil {

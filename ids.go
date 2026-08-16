@@ -1,23 +1,35 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"runtime"
+	"regexp"
 	"strings"
 )
 
-type requestIDs struct {
-	Session string
-	Request string
-	Project string
+const defaultOpenCodeVersion = "1.18.18"
+
+var defaultOpenCodeVersions = []string{
+	"1.18.18", "1.18.17", "1.18.16", "1.18.15", "1.18.14", "1.18.13",
+	"1.18.12", "1.18.11", "1.18.10", "1.18.9", "1.18.8", "1.18.7",
 }
 
-func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
+var gitProjectIDPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+type requestIDs struct {
+	Session   string
+	Request   string
+	Project   string
+	UserAgent string
+}
+
+func deriveRequestIDs(r *http.Request, body map[string]any, versions []string) requestIDs {
 	signal := firstString(
 		r.Header.Get("x-opencode-session"),
 		r.Header.Get("x-session-id"),
@@ -38,14 +50,48 @@ func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
 	}
 	session := stableID("ses", signal)
 	projectSignal := firstString(r.Header.Get("x-opencode-project"), stringAt(body, "metadata", "project_id"))
-	if projectSignal == "" {
-		projectSignal = "opencode2api:default-project"
+	return requestIDs{
+		Session:   session,
+		Request:   randomID("req", 16),
+		Project:   normalizeProjectID(projectSignal, session),
+		UserAgent: userAgentForSession(session, versions),
+	}
+}
+
+func deriveInternalRequestIDs(signal, requestID string, versions []string) requestIDs {
+	session := stableID("ses", "internal\x00"+signal)
+	if requestID == "" {
+		requestID = randomID("req", 16)
 	}
 	return requestIDs{
-		Session: session,
-		Request: randomID("req", 16),
-		Project: stableID("prj", projectSignal),
+		Session:   session,
+		Request:   requestID,
+		Project:   normalizeProjectID("", session),
+		UserAgent: userAgentForSession(session, versions),
 	}
+}
+
+func normalizeProjectID(explicit, session string) string {
+	if explicit != "" {
+		if explicit == "global" || gitProjectIDPattern.MatchString(explicit) {
+			return explicit
+		}
+		return sha1Hex(explicit)
+	}
+	return sha1Hex(session)
+}
+
+func sha1Hex(value string) string {
+	sum := sha1.Sum([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func internalKeySignal(value string) string {
+	if value == "" {
+		return "anonymous"
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 func conversationSeed(body map[string]any) string {
@@ -89,6 +135,35 @@ func firstString(values ...string) string {
 	return ""
 }
 
-func opencodeUserAgent() string {
-	return fmt.Sprintf("opencode/1.18.18 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
+func userAgentForSession(session string, versions []string) string {
+	return "opencode/" + rendezvousVersion(session, versions)
+}
+
+func defaultOpenCodeUserAgent() string {
+	return "opencode/" + defaultOpenCodeVersion
+}
+
+// rendezvousVersion uses highest-random-weight hashing so adding or removing a
+// version remaps only sessions whose winning version changed.
+func rendezvousVersion(session string, versions []string) string {
+	if len(versions) == 0 {
+		return defaultOpenCodeVersion
+	}
+	bestVersion := ""
+	var bestScore [sha256.Size]byte
+	for _, candidate := range versions {
+		score := sha256.Sum256([]byte(session + "\x00" + candidate))
+		if bestVersion == "" || bytes.Compare(score[:], bestScore[:]) > 0 || score == bestScore && candidate > bestVersion {
+			bestVersion, bestScore = candidate, score
+		}
+	}
+	return bestVersion
+}
+
+func setOpenCodeIdentityHeaders(req *http.Request, ids requestIDs) {
+	req.Header.Set("User-Agent", ids.UserAgent)
+	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-session", ids.Session)
+	req.Header.Set("x-opencode-request", ids.Request)
+	req.Header.Set("x-opencode-project", ids.Project)
 }

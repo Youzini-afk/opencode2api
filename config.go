@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,6 +33,7 @@ type Config struct {
 	Proxies     []string          `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Upstream    UpstreamConfig    `json:"upstream"`
+	Fingerprint FingerprintConfig `json:"fingerprint"`
 	Retry       RetryConfig       `json:"retry"`
 	Models      ModelsConfig      `json:"models"`
 	Performance PerformanceConfig `json:"performance"`
@@ -40,6 +42,10 @@ type Config struct {
 	Prefer      Tier              `json:"prefer"`
 
 	effectiveProxies []string
+}
+
+type FingerprintConfig struct {
+	Versions []string `json:"versions"`
 }
 
 type UpstreamConfig struct {
@@ -105,6 +111,7 @@ func defaultConfig() Config {
 	return Config{
 		Listen:      "127.0.0.1:8080",
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		Fingerprint: FingerprintConfig{Versions: append([]string(nil), defaultOpenCodeVersions...)},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
@@ -210,6 +217,8 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
+	trimList(&cfg.Fingerprint.Versions)
+	cfg.Fingerprint.Versions = uniqueStrings(cfg.Fingerprint.Versions)
 	cfg.ProxyFile = strings.TrimSpace(cfg.ProxyFile)
 	if err := resolveProxyFiles(path, &cfg); err != nil {
 		return Config{}, err
@@ -222,6 +231,14 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	}
 	if len(cfg.ServerKeys) == 0 {
 		return Config{}, errors.New("server_keys must contain at least one local key")
+	}
+	if len(cfg.Fingerprint.Versions) == 0 {
+		return Config{}, errors.New("fingerprint.versions must contain at least one version")
+	}
+	for _, value := range cfg.Fingerprint.Versions {
+		if !safeSemverPattern.MatchString(value) {
+			return Config{}, fmt.Errorf("fingerprint.versions contains invalid version %q", value)
+		}
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
@@ -281,6 +298,8 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	}
 	return cfg, nil
 }
+
+var safeSemverPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
 // RuntimeProxies returns the resolved proxy list, including proxyfile entries.
 // Config.Proxies intentionally remains the list stored in config.json so a

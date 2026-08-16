@@ -233,6 +233,7 @@ type ConfigView struct {
 	Proxies     []SecretView      `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Upstream    UpstreamConfig    `json:"upstream"`
+	Fingerprint FingerprintConfig `json:"fingerprint"`
 	Retry       RetryConfig       `json:"retry"`
 	Models      ModelsConfig      `json:"models"`
 	Performance PerformanceConfig `json:"performance"`
@@ -269,6 +270,7 @@ type ConfigUpdate struct {
 	Proxies     []SecretInput     `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Upstream    UpstreamConfig    `json:"upstream"`
+	Fingerprint FingerprintConfig `json:"fingerprint"`
 	Retry       RetryConfig       `json:"retry"`
 	Models      ModelsConfig      `json:"models"`
 	Performance PerformanceConfig `json:"performance"`
@@ -311,7 +313,7 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	candidate := Config{
 		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Proxies: proxies, ProxyFile: update.ProxyFile,
-		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
+		Upstream: update.Upstream, Fingerprint: update.Fingerprint, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		WebUI: WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
 	result, err := a.manager.Apply(candidate, true)
@@ -466,7 +468,7 @@ func (a *AdminServer) configView() ConfigView {
 	effective, restart := a.manager.RestartStatus()
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false),
-		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
+		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Fingerprint: cfg.Fingerprint, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},

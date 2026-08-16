@@ -194,7 +194,7 @@ type modelsResponse struct {
 	} `json:"data"`
 }
 
-func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) ([]string, int, error) {
+func fetchModels(ctx context.Context, client *http.Client, baseURL, key string, ids requestIDs) ([]string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/models", nil)
 	if err != nil {
 		return nil, 0, err
@@ -202,8 +202,7 @@ func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	req.Header.Set("User-Agent", opencodeUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
+	setOpenCodeIdentityHeaders(req, ids)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
