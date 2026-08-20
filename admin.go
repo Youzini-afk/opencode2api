@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -41,17 +42,21 @@ type loginWindow struct {
 }
 
 type AdminServer struct {
-	manager  *RuntimeManager
-	monitor  *Monitor
-	logs     *LogHub
-	logger   *slog.Logger
-	mu       sync.Mutex
-	sessions map[string]adminSession
-	attempts map[string]loginWindow
+	manager       *RuntimeManager
+	monitor       *Monitor
+	logs          *LogHub
+	logger        *slog.Logger
+	mu            sync.Mutex
+	sessions      map[string]adminSession
+	attempts      map[string]loginWindow
+	lastInference *DebugInferenceResult
 }
 
 func NewAdminServer(manager *RuntimeManager, monitor *Monitor, logs *LogHub, logger *slog.Logger) *AdminServer {
-	return &AdminServer{manager: manager, monitor: monitor, logs: logs, logger: logger, sessions: make(map[string]adminSession), attempts: make(map[string]loginWindow)}
+	return &AdminServer{
+		manager: manager, monitor: monitor, logs: logs, logger: logger, sessions: make(map[string]adminSession),
+		attempts: make(map[string]loginWindow),
+	}
 }
 
 func (a *AdminServer) Handler() http.Handler {
@@ -65,6 +70,8 @@ func (a *AdminServer) Handler() http.Handler {
 	mux.Handle("POST /api/config/reveal", a.authenticate(a.csrf(http.HandlerFunc(a.handleReveal))))
 	mux.Handle("PUT /api/account", a.authenticate(a.csrf(http.HandlerFunc(a.handleAccount))))
 	mux.Handle("GET /api/monitor", a.authenticate(http.HandlerFunc(a.handleMonitor)))
+	mux.Handle("GET /api/debug/models", a.authenticate(http.HandlerFunc(a.handleDebugModels)))
+	mux.Handle("POST /api/debug/inference", a.authenticate(a.csrf(http.HandlerFunc(a.handleDebugInference))))
 	mux.Handle("GET /api/logs", a.authenticate(http.HandlerFunc(a.handleLogs)))
 	mux.Handle("GET /api/logs/stream", a.authenticate(http.HandlerFunc(a.handleLogStream)))
 	mux.Handle("/", a.staticHandler())
@@ -230,6 +237,7 @@ type ConfigView struct {
 	ServerKeys  []SecretView      `json:"server_keys"`
 	ZenKeys     []SecretView      `json:"zen_keys"`
 	GoKeys      []SecretView      `json:"go_keys"`
+	Anonymous   bool              `json:"anonymous"`
 	Proxies     []SecretView      `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Upstream    UpstreamConfig    `json:"upstream"`
@@ -267,6 +275,7 @@ type ConfigUpdate struct {
 	ServerKeys  []SecretInput     `json:"server_keys"`
 	ZenKeys     []SecretInput     `json:"zen_keys"`
 	GoKeys      []SecretInput     `json:"go_keys"`
+	Anonymous   bool              `json:"anonymous"`
 	Proxies     []SecretInput     `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Upstream    UpstreamConfig    `json:"upstream"`
@@ -312,7 +321,7 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidate := Config{
-		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Proxies: proxies, ProxyFile: update.ProxyFile,
+		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
 		Upstream: update.Upstream, Fingerprint: update.Fingerprint, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		WebUI: WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
@@ -386,7 +395,154 @@ func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *AdminServer) handleMonitor(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"version": version, "metrics": a.monitor.Snapshot(), "resources": a.manager.Resources()})
+	metrics := a.monitor.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": version, "metrics": metrics, "usage": metrics.Usage, "upstream": metrics.Upstream, "resources": a.manager.Resources(),
+	})
+}
+
+type DebugInferenceRequest struct {
+	Protocol Protocol       `json:"protocol"`
+	Request  map[string]any `json:"request"`
+}
+
+type DebugInferenceResult struct {
+	OK         bool                 `json:"ok"`
+	HTTPStatus int                  `json:"http_status"`
+	DurationMS int64                `json:"duration_ms"`
+	RequestID  string               `json:"request_id,omitempty"`
+	Route      ModelRouteDiagnostic `json:"route"`
+	Response   any                  `json:"response"`
+}
+
+func (a *AdminServer) handleDebugModels(w http.ResponseWriter, _ *http.Request) {
+	models, metadata := a.manager.DebugModels()
+	a.mu.Lock()
+	last := a.lastInference
+	a.mu.Unlock()
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"models": models, "metadata": metadata, "last_inference": last})
+}
+
+func (a *AdminServer) handleDebugInference(w http.ResponseWriter, r *http.Request) {
+	var input DebugInferenceRequest
+	if err := decodeAdminJSON(w, r, &input); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if !validProtocol(input.Protocol) {
+		writeAdminError(w, http.StatusBadRequest, "invalid_protocol", "protocol must be chat, responses, or anthropic")
+		return
+	}
+	if input.Request == nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", "request must be a JSON object")
+		return
+	}
+	payload := cloneMap(input.Request)
+	payload["stream"] = false
+	model := stringAt(payload, "model")
+	if model == "" {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", "request.model is required")
+		return
+	}
+	route := a.manager.DebugRoute(model, input.Protocol)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", "request contains unsupported JSON values")
+		return
+	}
+	path := protocolPath(input.Protocol)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "http://gateway.local"+path, bytes.NewReader(encoded))
+	if err != nil {
+		writeAdminError(w, http.StatusInternalServerError, "debug_request_failed", "could not construct Gateway request")
+		return
+	}
+	cfg := a.manager.Config()
+	if len(cfg.ServerKeys) == 0 {
+		writeAdminError(w, http.StatusServiceUnavailable, "debug_unavailable", "no local server key is configured")
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+cfg.ServerKeys[0])
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	recorder := newDebugResponseRecorder()
+	started := time.Now()
+	a.manager.Handler().ServeHTTP(recorder, request)
+	duration := time.Since(started)
+	requestID := recorder.Header().Get("x-request-id")
+	if requestID != "" {
+		upstream := a.monitor.Snapshot().Upstream.Recent
+		for index := len(upstream) - 1; index >= 0; index-- {
+			if upstream[index].RequestID == requestID {
+				route.Anonymous = upstream[index].Anonymous
+				route.Tier = Tier(upstream[index].Tier)
+				break
+			}
+		}
+	}
+	var raw any
+	if json.Unmarshal(recorder.body.Bytes(), &raw) != nil {
+		raw = recorder.body.String()
+	}
+	raw = sanitizeDebugValue(raw, a.manager.redactor)
+	result := DebugInferenceResult{
+		OK: recorder.status >= 200 && recorder.status < 300, HTTPStatus: recorder.status,
+		DurationMS: max(duration.Milliseconds(), 0), RequestID: requestID, Route: route, Response: raw,
+	}
+	a.mu.Lock()
+	a.lastInference = &result
+	a.mu.Unlock()
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, result)
+}
+
+type debugResponseRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newDebugResponseRecorder() *debugResponseRecorder {
+	return &debugResponseRecorder{header: make(http.Header), status: http.StatusOK}
+}
+
+func (recorder *debugResponseRecorder) Header() http.Header { return recorder.header }
+
+func (recorder *debugResponseRecorder) WriteHeader(status int) {
+	if recorder.status != http.StatusOK || status == http.StatusOK {
+		return
+	}
+	recorder.status = status
+}
+
+func (recorder *debugResponseRecorder) Write(data []byte) (int, error) {
+	return recorder.body.Write(data)
+}
+
+func sanitizeDebugValue(value any, redactor *SecretRedactor) any {
+	switch current := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(current))
+		for key, item := range current {
+			lower := strings.ToLower(key)
+			if strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "api_key") || strings.Contains(lower, "api-key") {
+				result[key] = "***"
+				continue
+			}
+			result[key] = sanitizeDebugValue(item, redactor)
+		}
+		return result
+	case []any:
+		result := make([]any, len(current))
+		for index, item := range current {
+			result[index] = sanitizeDebugValue(item, redactor)
+		}
+		return result
+	case string:
+		return redactor.String(current)
+	default:
+		return value
+	}
 }
 
 func (a *AdminServer) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +623,7 @@ func (a *AdminServer) configView() ConfigView {
 	cfg := a.manager.Config()
 	effective, restart := a.manager.RestartStatus()
 	return ConfigView{
-		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false),
+		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
 		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Fingerprint: cfg.Fingerprint, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},

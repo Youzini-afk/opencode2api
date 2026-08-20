@@ -30,6 +30,7 @@ type Config struct {
 	ServerKeys  []string          `json:"server_keys"`
 	ZenKeys     []string          `json:"zen_keys"`
 	GoKeys      []string          `json:"go_keys"`
+	Anonymous   bool              `json:"anonymous"`
 	Proxies     []string          `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Upstream    UpstreamConfig    `json:"upstream"`

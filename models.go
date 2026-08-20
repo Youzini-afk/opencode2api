@@ -33,9 +33,28 @@ const (
 )
 
 type modelRoute struct {
-	ID       string
-	Tier     Tier
-	Protocol Protocol
+	ID        string
+	Tier      Tier
+	Protocol  Protocol
+	Anonymous bool
+	// KeyTiers contains at most the preferred authenticated tier. It is used
+	// only when an anonymous request is throttled; normal keyed requests never
+	// cross tiers implicitly.
+	KeyTiers []Tier
+}
+
+type ModelRouteDiagnostic struct {
+	Model                string            `json:"model"`
+	RequestedProtocol    Protocol          `json:"requested_protocol,omitempty"`
+	NativeProtocol       Protocol          `json:"native_protocol"`
+	ProtocolSource       string            `json:"protocol_source"`
+	AvailableZen         bool              `json:"available_zen"`
+	AvailableGo          bool              `json:"available_go"`
+	Tier                 Tier              `json:"tier,omitempty"`
+	Anonymous            bool              `json:"anonymous"`
+	KeyTiers             []Tier            `json:"key_tiers,omitempty"`
+	AnonymousEligibility AnonymousDecision `json:"anonymous_eligibility"`
+	RouteError           string            `json:"route_error,omitempty"`
 }
 
 type modelCatalog struct {
@@ -45,6 +64,7 @@ type modelCatalog struct {
 	protocols map[string]Protocol
 	updatedAt time.Time
 	prefer    Tier
+	metadata  *modelMetadataStore
 }
 
 type modelCatalogSnapshot struct {
@@ -95,37 +115,100 @@ func (c *modelCatalog) CopyState(source *modelCatalog) {
 	c.mu.Unlock()
 }
 
-func (c *modelCatalog) Route(model string, hasZenNodes, hasGoNodes bool) (modelRoute, error) {
+func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous, anonymousFirst bool) (modelRoute, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	protocol := c.protocols[model]
 	if protocol == "" {
 		protocol = inferProtocol(model)
 	}
-	// When a model exists on both tiers, honor the configured priority.
-	preferGo := c.prefer == TierGo
-	if preferGo && c.goModels[model] && hasGoNodes {
-		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
-	}
-	if c.zen[model] && hasZenNodes {
-		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
-	}
-	if !preferGo && c.goModels[model] && hasGoNodes {
-		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
-	}
-	// Model discovery can temporarily fail. Honor the configured priority.
-	if len(c.zen) == 0 && len(c.goModels) == 0 {
-		if preferGo && hasGoNodes {
-			return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
+	keyTiers := c.keyTierOrderLocked(model, hasZenKeys, hasGoKeys)
+	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
+	anonymousAvailable := hasAnonymous && (catalogPending || c.zen[model])
+	if anonymousFirst && anonymousAvailable {
+		fallback := keyTiers
+		if len(fallback) > 1 {
+			fallback = fallback[:1]
 		}
-		if hasZenNodes {
-			return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
-		}
-		if hasGoNodes {
-			return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
-		}
+		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol, Anonymous: true, KeyTiers: fallback}, nil
+	}
+	if len(keyTiers) > 0 {
+		return modelRoute{ID: model, Tier: keyTiers[0], Protocol: protocol, KeyTiers: keyTiers[:1]}, nil
+	}
+	if anonymousAvailable {
+		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol, Anonymous: true}, nil
 	}
 	return modelRoute{}, fmt.Errorf("model %q is not available in the configured Zen or Go pools", model)
+}
+
+// keyTierOrderLocked builds an authenticated route in prefer order. A tier is
+// included only when it has a key and advertises the model. Before the first
+// successful catalog refresh, configured key pools remain usable so temporary
+// discovery failures do not take the gateway offline.
+func (c *modelCatalog) keyTierOrderLocked(model string, hasZenKeys, hasGoKeys bool) []Tier {
+	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
+	available := func(tier Tier) bool {
+		switch tier {
+		case TierZen:
+			return hasZenKeys && (catalogPending || c.zen[model])
+		case TierGo:
+			return hasGoKeys && (catalogPending || c.goModels[model])
+		default:
+			return false
+		}
+	}
+	order := []Tier{TierZen, TierGo}
+	if c.prefer == TierGo {
+		order[0], order[1] = order[1], order[0]
+	}
+	result := make([]Tier, 0, len(order))
+	for _, tier := range order {
+		if available(tier) {
+			result = append(result, tier)
+		}
+	}
+	return result
+}
+
+func (c *modelCatalog) anonymousDecision(model string) AnonymousDecision {
+	// Metadata is diagnostic only. The anonymous upstream decides whether a
+	// model is usable; names, prices, providers and deprecation flags never hide
+	// a discovered model or pre-reject an inference request.
+	if c.metadata != nil {
+		decision := c.metadata.Decide(model)
+		decision.Allowed = true
+		decision.Source = "upstream_decides:" + decision.Source
+		return decision
+	}
+	return AnonymousDecision{Allowed: true, Source: "upstream_decides", Known: false}
+}
+
+func (c *modelCatalog) Diagnostic(model string, requested Protocol, hasZenKeys, hasGoKeys, hasAnonymous, anonymousFirst bool) ModelRouteDiagnostic {
+	c.mu.RLock()
+	protocol, explicit := c.protocols[model]
+	zen, goModel := c.zen[model], c.goModels[model]
+	c.mu.RUnlock()
+	source := "configured"
+	if !explicit {
+		protocol = inferProtocol(model)
+		source = "inferred"
+	}
+	diagnostic := ModelRouteDiagnostic{
+		Model: model, RequestedProtocol: requested, NativeProtocol: protocol, ProtocolSource: source,
+		AvailableZen: zen, AvailableGo: goModel, AnonymousEligibility: c.anonymousDecision(model),
+	}
+	route, err := c.Route(model, hasZenKeys, hasGoKeys, hasAnonymous, anonymousFirst)
+	if err != nil {
+		diagnostic.RouteError = err.Error()
+		return diagnostic
+	}
+	diagnostic.Tier, diagnostic.Anonymous = route.Tier, route.Anonymous
+	diagnostic.KeyTiers = append([]Tier(nil), route.KeyTiers...)
+	return diagnostic
+}
+
+func isFreeModel(model string) bool {
+	return strings.Contains(strings.ToLower(model), "free")
 }
 
 func (c *modelCatalog) List() []string {
@@ -175,6 +258,12 @@ func toSet(items []string) map[string]bool {
 
 func inferProtocol(model string) Protocol {
 	m := strings.ToLower(model)
+	// This compatibility model speaks Chat Completions despite being exposed
+	// beside models whose names can imply newer OpenAI-style protocols. An
+	// explicit models.protocols entry is resolved before this default.
+	if m == "deepseek-v4-flash-free" {
+		return ProtocolChat
+	}
 	for _, prefix := range []string{"claude-", "qwen"} {
 		if strings.HasPrefix(m, prefix) {
 			return ProtocolAnthropic

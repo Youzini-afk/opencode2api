@@ -58,6 +58,7 @@ func TestAdminConfigFingerprintPUTRoundTrip(t *testing.T) {
 		ServerKeys:  secretInputs(view.ServerKeys),
 		ZenKeys:     secretInputs(view.ZenKeys),
 		GoKeys:      secretInputs(view.GoKeys),
+		Anonymous:   true,
 		Proxies:     secretInputs(view.Proxies),
 		ProxyFile:   view.ProxyFile,
 		Upstream:    view.Upstream,
@@ -95,5 +96,8 @@ func TestAdminConfigFingerprintPUTRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(persisted.Fingerprint.Versions, want) {
 		t.Fatalf("persisted fingerprint = %#v, want %#v", persisted.Fingerprint.Versions, want)
+	}
+	if !persisted.Anonymous || !response.Config.Anonymous {
+		t.Fatalf("anonymous setting did not round-trip: persisted=%v response=%v", persisted.Anonymous, response.Config.Anonymous)
 	}
 }

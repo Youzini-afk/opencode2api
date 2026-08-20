@@ -5,6 +5,11 @@ services:
       dockerfile: Dockerfile
     image: opencode2api:local
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     environment:
       - PORT=${PORT:-8080}
       - CONFIG_PATH

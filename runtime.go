@@ -37,6 +37,7 @@ type RuntimeManager struct {
 	current    atomic.Pointer[gatewayRuntime]
 	updateMu   sync.Mutex
 	effective  effectiveListeners
+	metadata   *modelMetadataStore
 }
 
 type effectiveListeners struct {
@@ -50,6 +51,7 @@ func NewRuntimeManager(root context.Context, configPath string, cfg Config, logg
 		configPath: configPath, root: root, logger: logger, monitor: monitor, hub: hub, redactor: redactor, level: level,
 		effective: effectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
 	}
+	manager.metadata = newModelMetadataStore(configPath, logger)
 	if cfg.WebUI.Password != "" {
 		hash, err := hashPassword(cfg.WebUI.Password)
 		if err != nil {
@@ -72,6 +74,7 @@ func NewRuntimeManager(root context.Context, configPath string, cfg Config, logg
 	manager.redactor.Replace(cfg)
 	setLogLevel(manager.level, cfg.Logging.Level)
 	manager.start(runtime)
+	manager.metadata.Start(root)
 	return manager, nil
 }
 
@@ -80,6 +83,7 @@ func (m *RuntimeManager) build(cfg Config) (*gatewayRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	gateway.catalog.metadata = m.metadata
 	return &gatewayRuntime{config: cfg, gateway: gateway, handler: gateway.Handler(), cancel: func() {}}, nil
 }
 
@@ -221,9 +225,11 @@ func (m *RuntimeManager) Shutdown() {
 }
 
 type ResourceSnapshot struct {
-	Models  modelCatalogSnapshot `json:"models"`
-	Keys    []KeyStatus          `json:"keys"`
-	Proxies []ProxyStatus        `json:"proxies"`
+	Models    modelCatalogSnapshot `json:"models"`
+	Keys      []KeyStatus          `json:"keys"`
+	Proxies   []ProxyStatus        `json:"proxies"`
+	Anonymous bool                 `json:"anonymous"`
+	Metadata  MetadataSnapshot     `json:"metadata"`
 }
 
 type KeyStatus struct {
@@ -237,12 +243,13 @@ type KeyStatus struct {
 }
 
 type ProxyStatus struct {
-	Index    int    `json:"index"`
-	Address  string `json:"address"`
-	Healthy  bool   `json:"healthy"`
-	Checking bool   `json:"checking"`
-	ZenKeys  int    `json:"zen_keys"`
-	GoKeys   int    `json:"go_keys"`
+	Index     int    `json:"index"`
+	Address   string `json:"address"`
+	Healthy   bool   `json:"healthy"`
+	Checking  bool   `json:"checking"`
+	ZenKeys   int    `json:"zen_keys"`
+	GoKeys    int    `json:"go_keys"`
+	Anonymous bool   `json:"anonymous"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -251,9 +258,13 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		return ResourceSnapshot{}
 	}
 	gateway := runtime.gateway
-	result := ResourceSnapshot{Models: gateway.catalog.Snapshot()}
+	result := ResourceSnapshot{Models: gateway.catalog.Snapshot(), Anonymous: gateway.anonymous.Len() > 0}
+	if gateway.catalog.metadata != nil {
+		result.Metadata = gateway.catalog.metadata.Snapshot()
+	}
 	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
 	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)
+	result.Keys = append(result.Keys, anonymousKeyStatuses(gateway.anonymous)...)
 	gateway.zenNodes.bindingsMu.Lock()
 	zenBindings := append([]int(nil), gateway.zenNodes.bindingCount...)
 	gateway.zenNodes.bindingsMu.Unlock()
@@ -261,14 +272,60 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	goBindings := append([]int(nil), gateway.goNodes.bindingCount...)
 	gateway.goNodes.bindingsMu.Unlock()
 	for _, proxy := range gateway.transports.items {
-		status := ProxyStatus{Index: proxy.index, Address: redactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load()}
+		status := ProxyStatus{Index: proxy.index, Address: redactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(), Anonymous: gateway.anonymous.Len() > 0}
 		if proxy.index < len(zenBindings) {
 			status.ZenKeys = zenBindings[proxy.index]
 		}
 		if proxy.index < len(goBindings) {
 			status.GoKeys = goBindings[proxy.index]
 		}
+		if gateway.anonymous.Len() > 0 && gateway.zenNodes.Len() == 0 {
+			status.ZenKeys++
+		}
 		result.Proxies = append(result.Proxies, status)
+	}
+	return result
+}
+
+func (m *RuntimeManager) DebugModels() ([]ModelRouteDiagnostic, MetadataSnapshot) {
+	runtime := m.current.Load()
+	if runtime == nil {
+		return nil, MetadataSnapshot{}
+	}
+	gateway := runtime.gateway
+	models := gateway.catalog.List()
+	result := make([]ModelRouteDiagnostic, 0, len(models))
+	for _, model := range models {
+		result = append(result, gateway.catalog.Diagnostic(model, "", gateway.zenNodes.Len() > 0, gateway.goNodes.Len() > 0, gateway.anonymous.Len() > 0, gateway.anonymousFirst))
+	}
+	metadata := MetadataSnapshot{}
+	if gateway.catalog.metadata != nil {
+		metadata = gateway.catalog.metadata.Snapshot()
+	}
+	return result, metadata
+}
+
+func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRouteDiagnostic {
+	runtime := m.current.Load()
+	if runtime == nil {
+		return ModelRouteDiagnostic{Model: model, RequestedProtocol: requested, RouteError: "gateway runtime is unavailable"}
+	}
+	gateway := runtime.gateway
+	return gateway.catalog.Diagnostic(model, requested, gateway.zenNodes.Len() > 0, gateway.goNodes.Len() > 0, gateway.anonymous.Len() > 0, gateway.anonymousFirst)
+}
+
+func anonymousKeyStatuses(pool *anonymousPool) []KeyStatus {
+	if pool == nil {
+		return nil
+	}
+	result := make([]KeyStatus, 0, len(pool.nodes))
+	for index, node := range pool.nodes {
+		status := KeyStatus{ID: "anonymous", Tier: string(TierZen), Index: index, ProxyIndex: node.proxy.index, Failures: node.failures.Load(), Anonymous: true}
+		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
+			value := time.Unix(0, until).UTC()
+			status.CooldownUntil = &value
+		}
+		result = append(result, status)
 	}
 	return result
 }

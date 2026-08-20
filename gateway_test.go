@@ -138,8 +138,8 @@ func TestInferenceUsesAnonymousZenBeforeCatalogRefresh(t *testing.T) {
 	if authorization != "" || apiKey != "" {
 		t.Fatalf("anonymous inference sent authentication headers: Authorization=%q x-api-key=%q", authorization, apiKey)
 	}
-	if len(gateway.cfg.ZenKeys) != 0 || gateway.zenNodes.Len() != 1 || gateway.zenNodes.nodes[0].key != "" {
-		t.Fatalf("anonymous runtime node invariant failed: cfg keys=%#v nodes=%#v", gateway.cfg.ZenKeys, gateway.zenNodes.nodes)
+	if len(gateway.cfg.ZenKeys) != 0 || gateway.zenNodes.Len() != 0 || gateway.anonymous.Len() != 1 {
+		t.Fatalf("anonymous runtime node invariant failed: cfg keys=%#v keyed nodes=%#v anonymous=%d", gateway.cfg.ZenKeys, gateway.zenNodes.nodes, gateway.anonymous.Len())
 	}
 }
 
@@ -200,7 +200,7 @@ func TestAnonymousZenCatalogRoutesWithGoPoolAndPreference(t *testing.T) {
 		{model: "both", want: TierGo},
 	}
 	for _, test := range tests {
-		route, err := gateway.catalog.Route(test.model, gateway.zenNodes.Len() > 0, gateway.goNodes.Len() > 0)
+		route, err := gateway.catalog.Route(test.model, gateway.zenNodes.Len() > 0, gateway.goNodes.Len() > 0, gateway.anonymous.Len() > 0, gateway.anonymousFirst)
 		if err != nil {
 			t.Fatalf("Route(%q) error = %v", test.model, err)
 		}
@@ -329,7 +329,7 @@ func TestModelRefreshRetryUsesCompleteStableAnonymousIdentity(t *testing.T) {
 	cfg := gatewayTestConfig(server.URL)
 	cfg.Retry.MaxAttempts = 2
 	gateway := newGatewayForTest(t, cfg)
-	models := gateway.refreshTier(context.Background(), TierZen, server.URL, gateway.zenNodes, "req_refresh_round")
+	models := gateway.refreshZen(context.Background(), "req_refresh_round")
 	if !reflect.DeepEqual(models, []string{"model-a"}) || len(captured) != 2 {
 		t.Fatalf("refresh models = %#v, attempts = %d", models, len(captured))
 	}
