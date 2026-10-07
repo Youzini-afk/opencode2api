@@ -32,8 +32,8 @@ jobs:
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "image_name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-  test:
-    name: Test
+  verify:
+    name: Verify source
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -45,12 +45,18 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run tests
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
         run: go test ./...
+
+      - name: Build
+        run: go build ./...
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: [prepare, test]
+    needs: [prepare, verify]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -112,8 +118,9 @@ jobs:
           ARCHIVE_FORMAT: ${{ matrix.archive }}
         run: |
           mkdir -p "dist/$PACKAGE_NAME"
-          go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG" -o "dist/$PACKAGE_NAME/opencode2api$EXTENSION" ./
-          cp README.md config.example.json "dist/$PACKAGE_NAME/"
+          go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG" -o "dist/$PACKAGE_NAME/opencode2api$EXTENSION" ./cmd/opencode2api
+          cp README.md README.zh-CN.md LICENSE config.example.json "dist/$PACKAGE_NAME/"
+          cp -r docs "dist/$PACKAGE_NAME/"
           if [[ "$ARCHIVE_FORMAT" == "zip" ]]; then
             (cd dist && zip -q -r "$PACKAGE_NAME.zip" "$PACKAGE_NAME")
             archive="$PACKAGE_NAME.zip"
@@ -134,7 +141,7 @@ jobs:
 
   container:
     name: Publish GHCR image
-    needs: [prepare, test]
+    needs: [prepare, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -169,6 +176,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=opencode2api
             org.opencontainers.image.description=OpenAI-compatible API gateway for OpenCode Zen and Go
+            org.opencontainers.image.licenses=GPL-3.0-or-later
 
       - name: Build and push image
         uses: docker/build-push-action@v6

@@ -4,17 +4,27 @@
   "zen_keys": [],
   "go_keys": [],
   "anonymous": false,
-  "prefer": "go",
-  "proxyfile": "",
   "proxies": ["direct"],
+  "proxyfile": "",
   "upstream": {
     "zen": "https://opencode.ai/zen",
-    "go": "https://opencode.ai/zen/go"
+    "go": "https://opencode.ai/zen/go",
+    "agent_shaping": false
   },
   "fingerprint": {
     "versions": [
-      "1.18.18", "1.18.17", "1.18.16", "1.18.15", "1.18.14", "1.18.13",
-      "1.18.12", "1.18.11", "1.18.10", "1.18.9", "1.18.8", "1.18.7"
+      "1.18.18",
+      "1.18.17",
+      "1.18.16",
+      "1.18.15",
+      "1.18.14",
+      "1.18.13",
+      "1.18.12",
+      "1.18.11",
+      "1.18.10",
+      "1.18.9",
+      "1.18.8",
+      "1.18.7"
     ]
   },
   "retry": {
@@ -23,7 +33,8 @@
   },
   "models": {
     "refresh_seconds": 300,
-    "protocols": {}
+    "protocols": {},
+    "probe_availability": false
   },
   "performance": {
     "max_idle_conns": 2048,
@@ -31,11 +42,14 @@
     "max_conns_per_host": 0,
     "idle_conn_timeout_seconds": 120,
     "connect_timeout_seconds": 5,
-    "failure_cooldown_seconds": 15
+    "failure_cooldown_seconds": 15,
+    "attempt_timeout_seconds": 0,
+    "first_event_timeout_seconds": 0
   },
   "logging": {
     "level": "info",
-    "ring_size": 2000
+    "ring_size": 2000,
+    "dump_request_bodies": false
   },
   "webui": {
     "enabled": true,
@@ -43,5 +57,21 @@
     "username": "admin",
     "password": "change-this-admin-password",
     "session_ttl_minutes": 720
+  },
+  "prefer": "go",
+  "reasoning": {
+    "effort": "",
+    "effort_by_model": {}
+  },
+  "rotation": {
+    "sota": {
+      "alias": "sota",
+      "order": ["deepseek-v4.1-flash", "glm-5.3", "grok-4.6", "kimi-k3", "qwen3.8-max"]
+    },
+    "sweet": {
+      "alias": "sweet",
+      "order": []
+    },
+    "first_output_seconds": 30
   }
 }

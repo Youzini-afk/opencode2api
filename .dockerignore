@@ -3,6 +3,10 @@
 !docker-entrypoint.sh
 !go.mod
 !go.sum
-!*.go
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!LICENSE
 !webui/
 !webui/**
