@@ -96,8 +96,7 @@
             </div>
             <p>
               开启探测后检查免费模型；结果仅供诊断，不影响模型目录。先匿名再尝试 Zen
-              Key；全部失败后标记探测失败，24
-              小时后复测，正常推理仍可使用。成功或手动重置后，下一次探测在 1 小时后。
+              Key。明确模型失效后记录诊断结果并在 24 小时后复测；临时错误通常 1 小时后重试，已有失效记录则保留并在 24 小时后复测。结果不禁用生产推理、不隐藏模型。手动控制会暂停该模型的探测；切回自动后重新调度。auto 思考强度只有开启探测后才会验证档位，过期观察不再下发。
             </p>
             <p id="availability-error" role="status"></p>
             <div class="table-wrap">
@@ -107,6 +106,8 @@
                     <th>模型</th>
                     <th>状态</th>
                     <th>通道 / 结果</th>
+                    <th>控制</th>
+                    <th>已验证思考档位</th>
                     <th>上次探测</th>
                     <th>下次探测</th>
                     <th>操作</th>
@@ -564,13 +565,19 @@
                 <div>
                   <h2>上游与协议路由</h2>
                   <div class="section-caption">
-                    anonymous 会耗尽可用 Proxy；显式 protocol 映射优先于模型名称推断。
+                    anonymous 受每通道重试次数约束，只有 429 才回退首选 Key；显式 protocol 映射优先于模型名称推断。
                   </div>
                 </div>
               </div>
               <div class="form-grid">
+                <div class="field full">
+                  <label class="check-label"
+                    ><input id="c-free-only" type="checkbox" />仅暴露免费模型（即使配置了 Zen / Go Key）</label
+                  >
+                </div>
                 <div class="field"><label>Zen URL</label><input id="c-up-zen" /></div>
                 <div class="field"><label>Go URL</label><input id="c-up-go" /></div>
+                <div class="field full"><label>匿名推理 URL（留空自动选择；自定义 Zen 默认沿用原地址）</label><input id="c-up-anonymous" /></div>
                 <div class="field full">
                   <label>OpenCode CLI 版本池（每行一个）</label
                   ><textarea id="c-fingerprint-versions" spellcheck="false"></textarea>
@@ -578,7 +585,7 @@
                 <div class="field full">
                   <label
                     ><input id="c-agent-shaping" type="checkbox" />Agent
-                    请求兼容：强制上游流式并补核心工具定义（默认关闭）</label
+                    请求兼容：对自定义上游也强制流式并使用官方工具定义（官方端点自动启用）</label
                   >
                 </div>
                 <div class="field full">
@@ -619,6 +626,7 @@
                   <label>默认强度</label
                   ><select id="c-reasoning-effort">
                     <option value="">跟随客户端</option>
+                    <option value="auto">auto（探测最高可用档）</option>
                     <option value="minimal">minimal</option>
                     <option value="low">low</option>
                     <option value="medium">medium</option>
@@ -906,6 +914,7 @@
                     <th>名称</th>
                     <th>密钥尾码</th>
                     <th>状态</th>
+                    <th>用量（近 1 小时 / 累计）</th>
                     <th>创建时间</th>
                     <th>操作</th>
                   </tr>

@@ -23,7 +23,7 @@ import (
 func (g *Gateway) syncRotation() {
 	available := map[string]bool{}
 	for _, model := range g.catalog.List() {
-		if _, err := g.catalog.RouteForTier(model, config.TierGo, false, g.goNodes.Len() > 0); err == nil {
+		if route, err := g.catalog.RouteForTier(model, config.TierGo, false, g.goNodes.Len() > 0); err == nil && route.Protocol != wire.SystemOne {
 			available[model] = true
 		}
 	}
@@ -70,6 +70,7 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 	meta := telemetry.MetaFromRequest(r)
 	if meta != nil {
 		meta.Request = ids.Request
+		meta.Session = ids.Session
 		meta.ModelAlias = alias
 	}
 	visited := map[string]bool{}

@@ -12,7 +12,7 @@ let csrf = "",
   logRenderPending = false,
   toastTimer = null;
 const pages = {
-  availability: ["13", "免费模型可用性", "可选诊断探测，失败后每 24 小时复测，不禁用模型。"],
+  availability: ["13", "免费模型可用性", "可选诊断探测，手动控制可暂停探测，不禁用模型。"],
   rotation: ["12", "模型轮转", "共享当前模型、故障切换与尝试记录。"],
   overview: ["01", "运行桌面", "最近一小时、进程累计与当前资源状态。"],
   guide: ["02", "首次运行", "用六个检查点完成从配置到首个请求。"],
@@ -145,6 +145,7 @@ function fillConfig(value) {
   $("#c-proxyfile").value = value.proxyfile;
   $("#c-up-zen").value = value.upstream.zen;
   $("#c-up-go").value = value.upstream.go;
+  $("#c-up-anonymous").value = value.upstream.anonymous || "";
   $("#c-fingerprint-versions").value = (value.fingerprint?.versions || []).join("\n");
   $("#c-agent-shaping").checked = !!value.upstream.agent_shaping;
   $("#c-probe-availability").checked = !!value.models.probe_availability;
@@ -152,6 +153,7 @@ function fillConfig(value) {
   $("#c-timeout").value = value.retry.timeout_seconds;
   $("#c-refresh").value = value.models.refresh_seconds;
   $("#c-protocols").value = JSON.stringify(value.models.protocols || {}, null, 2);
+  $("#c-free-only").checked = !!value.models.free_only;
   const reasoning = value.reasoning || {};
   $("#c-reasoning-effort").value = reasoning.effort || "";
   $("#c-reasoning-by-model").value = JSON.stringify(reasoning.effort_by_model || {}, null, 2);
@@ -216,6 +218,7 @@ $("#config-form").addEventListener("submit", async (event) => {
       upstream: {
         zen: $("#c-up-zen").value,
         go: $("#c-up-go").value,
+        anonymous: $("#c-up-anonymous").value,
         agent_shaping: $("#c-agent-shaping").checked,
       },
       fingerprint: {
@@ -229,6 +232,7 @@ $("#config-form").addEventListener("submit", async (event) => {
         refresh_seconds: number("#c-refresh"),
         protocols: JSON.parse($("#c-protocols").value || "{}"),
         probe_availability: $("#c-probe-availability").checked,
+        free_only: $("#c-free-only").checked,
       },
       reasoning: {
         effort: $("#c-reasoning-effort").value,
@@ -1122,6 +1126,9 @@ function renderAPIKeys(keys) {
     appendCell(row, key.name);
     appendCell(row, key.display, "mono");
     appendCell(row, key.enabled ? "已启用" : "已停用", key.enabled ? "status ok" : "status warn");
+    const usage = key.usage || {},
+      summary = (value = {}) => `${formatTokens(value.requests)} 次 · ${formatTokens(value.total_tokens)} tokens`;
+    appendCell(row, `${summary(usage.last_hour)} / ${summary(usage.lifetime)}`);
     appendCell(row, key.created_at ? localTime(key.created_at) : "已有配置");
     const cell = document.createElement("td"),
       actions = document.createElement("div");
@@ -1156,7 +1163,7 @@ function renderAPIKeys(keys) {
     row.appendChild(cell);
     host.appendChild(row);
   }
-  if (!keys.length) emptyRow(host, 5, "暂无 API Key");
+  if (!keys.length) emptyRow(host, 6, "暂无 API Key");
 }
 $("#api-key-form").onsubmit = async (event) => {
   event.preventDefault();
@@ -1415,12 +1422,18 @@ async function loadAvailability() {
         item.model,
         item.disabled
           ? "探测失败"
-          : item.checked_at && !item.checked_at.startsWith("0001-")
+          : item.reason === "probe_succeeded"
             ? "探测成功"
-            : "待探测",
+            : item.checked_at && !item.checked_at.startsWith("0001-")
+              ? "结果不确定"
+              : "待探测",
         [item.channel, item.reason].filter(Boolean).join(" / ") || "待探测",
+        item.manual ? "手动" : "自动",
+        item.auto_effort?.effort
+          ? `${item.auto_effort.effort}（${date(item.effort_checked_at)}）`
+          : "未验证",
         date(item.checked_at),
-        date(item.next_check),
+        item.manual ? "手动控制，不自动探测" : date(item.next_check),
       ]) {
         const cell = document.createElement("td");
         cell.textContent = value;
@@ -1428,10 +1441,11 @@ async function loadAvailability() {
       }
       const cell = document.createElement("td");
       const button = document.createElement("button");
-      button.textContent = "重置探测状态";
+      button.textContent = "清除失败并暂停探测";
       button.disabled = !item.disabled;
       button.onclick = async () => {
         button.disabled = true;
+        toggle.disabled = true;
         try {
           await api("/api/models/restore", {
             method: "POST",
@@ -1441,10 +1455,31 @@ async function loadAvailability() {
           await loadDebugModels();
         } catch (error) {
           $("#availability-error").textContent = error.message;
-          button.disabled = false;
+          button.disabled = !item.disabled;
+          toggle.disabled = false;
         }
       };
       cell.append(button);
+      const toggle = document.createElement("button");
+      toggle.className = "ghost";
+      toggle.textContent = item.manual ? "切回自动" : "切为手动";
+      toggle.onclick = async () => {
+        button.disabled = true;
+        toggle.disabled = true;
+        try {
+          await api("/api/models/manual", {
+            method: "POST",
+            body: JSON.stringify({ model: item.model, manual: !item.manual }),
+          });
+          await loadAvailability();
+          await loadDebugModels();
+        } catch (error) {
+          $("#availability-error").textContent = error.message;
+          button.disabled = !item.disabled;
+          toggle.disabled = false;
+        }
+      };
+      cell.append(toggle);
       row.append(cell);
       $("#availability-models").append(row);
     }

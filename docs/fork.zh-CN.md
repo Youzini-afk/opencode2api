@@ -63,6 +63,10 @@ docker compose up -d
 
 ## 与上游不同的路由约定
 
-无 Zen Key 自动匿名，不发送 public 哨兵或空认证头。匿名 401/403 直接返回；只有 429 才回退一个首选 Key Tier。普通 Key 请求不跨 Tier。目录不按模型名、成本、弃用、能力缺失或探测失败筛选。
+无 Zen Key 自动匿名，不需要个人上游 Key。官方匿名端点使用公开的 `public` 标记；自定义中转默认不发送认证头。匿名 401/403 直接返回；只有 429 才回退一个首选 Key Tier。普通 Key 请求不跨 Tier。默认目录不按模型名、成本、弃用、能力缺失或探测失败筛选；新增 `models.free_only` 只有显式开启才筛选。
 
-Agent 请求改形由 upstream.agent_shaping 控制，默认关闭。模型探测由 models.probe_availability 控制，默认关闭；探测只影响诊断信息。两者可在配置页显式开启。System One、动态协议发现、模型元数据、轮转别名、额度查询和 API Key 管理已按上游包结构接入。
+官方端点自动使用新版 CLI 请求形状与官方工具定义，自定义中转仅在显式开启 `upstream.agent_shaping` 后改形。`upstream.anonymous` 可单独配置匿名推理地址；旧配置中的官方 Zen 自动升级到 inference 地址，自定义 Zen 默认沿用原地址，不会被转发到官方服务器。模型探测由 `models.probe_availability` 控制，默认关闭；探测只影响诊断信息，手动控制可暂停探测。
+
+会话稳定版本池与 project 分桶继续保留；UA 更新为 `opencode/latest/<version>/cli`，session 采用降序编码并发送两个一致的 session 头。本地 request ID 仍保持每请求唯一和重试稳定，但不再作为旧 `x-opencode-request` 头发送上游。已有版本池不会被升级覆盖。
+
+System One、动态协议发现、模型与成本元数据、轮转别名、额度查询和 API Key 管理均保留。用量新增按本地 API Key 和会话统计，热重载保留，进程重启清零。

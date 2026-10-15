@@ -119,6 +119,29 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	node.cooldownUntil.Store(0)
 }
 
+// RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
+// proxy, mirroring nodePool.RestoreProxy for key nodes. Without this, an
+// outage-era cooldown survives the proxy's recovery and the anonymous lane
+// stays skipped even though the route is healthy again.
+func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
+	if p == nil || proxy == nil {
+		return 0
+	}
+	cleared := 0
+	for _, node := range p.nodes {
+		if node.proxy != proxy {
+			continue
+		}
+		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 {
+			continue
+		}
+		node.failures.Store(0)
+		node.cooldownUntil.Store(0)
+		cleared++
+	}
+	return cleared
+}
+
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
 	if node == nil {
 		return
@@ -252,7 +275,7 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 // route is unavailable. HTTP responses and unrelated transport/protocol errors
 // must not evict a proxy.
 func isProxyFailure(err error) bool {
-	if errors.Is(err, errFirstEventTimeout) {
+	if errors.Is(err, errFirstEventTimeout) || upstreamAccepted(err) {
 		return false // The upstream accepted HTTP; slow generation is not a broken proxy.
 	}
 	if err == nil {

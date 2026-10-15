@@ -136,7 +136,7 @@ curl http://localhost:8080/v1/messages \
 curl http://localhost:8080/v1/systemone \
   -H "Authorization: Bearer YOUR_LOCAL_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"MODEL_ID","state":"...","questions":[...]}'
+  -d '{"model":"MODEL_ID","state":"1 + 1 = 2","questions":{"arithmetic":{"type":"noul","instructions":"Is 1 + 1 equal to 2?"}}}'
 ```
 
 System One 将自由文本状态与类型化问题配对，并返回类型化答案，因此其负载与 chat/responses 桥接结构完全不同，只做原样转发，不做任何转换。只有原生协议为 System One 的模型才能在本接口提供服务；在消息接口（`/v1/chat/completions`、`/v1/responses`）上提交的决策负载同样原样转发，而不经过转换。上游的流式回复按原样透传，不做中断恢复。
@@ -170,19 +170,23 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 成本、弃用信息及模型限制来自官方 [OpenCode 元数据地址](https://models.opencode.ai/api.json)，每 24 小时刷新一次。能力目录中的限制优先；元数据中的 `limit.context`、`limit.input` 和 `limit.output` 仅补充缺失字段，通过 `/v1/models` 的 `context_window` / `context_length`、`max_input`、`max_output` 暴露。每个 HTTP 客户端的拉取超时为 30 秒，刷新失败时保留已有数据。升级后继续兼容原有 `.models.dev.json` 缓存文件名，无需删除缓存。
 
+元数据给出价格时，`/v1/models` 的每个条目还会带上 `cost`（每百万 token 的美元价格：`input`、`output`、`cache_read`、`cache_write`，以及 OpenClaw 使用的 `cacheRead` / `cacheWrite`）。推理模型会在 `reasoning_efforts` 和 OpenClaw 读取的 `compat.supportedReasoningEfforts` 中列出可用档位：`minimal` 到 `max`；思考强度为 `auto` 时截止到探测得到的上限。强制或探测得到的档位通过 `default_reasoning_effort` 给出。缓存价格字段会在下一次元数据刷新后出现。
+
 ### 匿名通道与回退
 
-没有 Zen Key 时自动启用真正无凭证的 keyless Zen，不发送 Authorization 或 x-api-key。配置 Key 后，可显式设置 `anonymous: true` 优先匿名 Zen。模型目录与推理资格不会按价格、free 名称、提供商、Gemini 名称或探测状态筛选；由上游真实响应决定。
+没有 Zen Key 时自动启用匿名访问，不需要个人 API Key。官方匿名端点使用公开的 `public` 标记；自定义中转默认不发送认证头。配置 Key 后，可显式设置 `anonymous: true` 优先匿名访问。默认不会按价格、free 名称、提供商、Gemini 名称或探测状态筛选模型；由上游真实响应决定。只有显式开启 `models.free_only: true`，才按免费模型分类同时限制目录与推理。
 
 匿名传输失败、5xx 和 429 在配置的重试预算内处理；匿名 401/403 及其他非 429 的 4xx 直接返回。只有匿名出现 429 才允许回退到 `prefer` 选中的一个 Key Tier。普通 Key 请求始终在首选 Tier 内轮换 Key，不自动跨 Tier。
 
 每个实际目标单独按其原生协议编码请求。`performance.first_event_timeout_seconds` 可选启用首个完整 SSE data 事件之前的重试；客户端收到输出后不再重放。已知过期 Responses reasoning 引用可触发一次保留请求身份的修复重试；指定 Key 的诊断不执行该重放。
 
-`upstream.agent_shaping` 默认关闭。某些上游要求 agent 请求形状时可开启：强制上游流式并补缺失的核心工具定义，非流式客户端收到合成 JSON 响应。只有确实需要该请求改形时才启用。
+官方 OpenCode 端点自动使用新版 CLI 请求形状：上游流式、官方核心工具定义；被 gate 识别的同名工具定义也会替换为官方 schema。非流式客户端仍收到合成 JSON。自定义中转保持透明，除非显式开启 `upstream.agent_shaping`。新增 `upstream.anonymous` 可单独指定匿名推理地址；省略时，官方 Zen 自动切到 `https://opencode.ai/inference`，自定义 Zen 则沿用原地址。匿名推理后端没有模型目录时，会回到配置的 Zen 地址取目录。
 
 ### 模型可用性诊断
 
 `models.probe_availability` 默认关闭。开启后定时发送短推理探测，可能消耗上游额度。结果仅供诊断，不隐藏目录模型、不拒绝正常推理。探测状态与手动重置仍可通过管理页和已鉴权管理接口查看。
+
+手动控制会暂停模型的探测；切回自动后重新调度。`reasoning.effort: "auto"` 仅使用近期验证过的档位，不会自行开启探测。临时错误不代表模型已下架。`POST /api/models/manual` 接受 `{"model":"MODEL_ID","manual":true|false}`，需要管理登录和 CSRF 校验。
 
 ### 会话与代理
 
@@ -209,16 +213,19 @@ Key 初始化时均衡分配到代理。真实流量可以触发代理检查、K
 | `prefer`                    | `go`；可选 `go`、`zen`。                                                      |
 | `upstream.zen`              | `https://opencode.ai/zen`。                                                   |
 | `upstream.go`               | `https://opencode.ai/zen/go`。                                                |
+| `upstream.anonymous`        | 可选；官方 Zen 使用 `https://opencode.ai/inference`，自定义 Zen 沿用原地址。 |
 | `proxies`                   | 两个代理来源都为空时，使用 `["direct"]`。                                     |
 | `proxyfile`                 | 可选；相对路径基于配置文件所在目录解析。                                      |
 | `models.refresh_seconds`    | `300`；最小为 1。                                                             |
 | `models.protocols`          | `{}`；按模型 ID 覆盖原生协议。                                                |
-| `reasoning.effort`          | 空（关闭）；可选 `minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`none`。 |
+| `models.free_only`          | `false`；仅显式开启后筛选免费模型的目录和推理。 |
+| `models.probe_availability` | `false`；可选诊断推理探测。 |
+| `reasoning.effort`          | 空（关闭）；可选 `auto`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`none`。 |
 | `reasoning.effort_by_model` | `{}`；按模型 ID 覆盖 `reasoning.effort`。                                     |
 
 ### 会话稳定的 CLI 指纹
 
-`fingerprint.versions` 可在管理页按一行一个版本配置。版本按会话稳定分桶，User-Agent 严格为 `opencode/<version>`。session 与 SHA-1 形状的 project 稳定，每个新客户端请求生成新的 request ID，内部重试复用整套身份。采用上游规范 session ID，并保留 parent session 与缓存亲和头。旧版本池在配置保存与热重载时完整保留。
+`fingerprint.versions` 可在管理页按一行一个版本配置。版本按会话稳定分桶，User-Agent 为 `opencode/latest/<version>/cli`。降序编码的 session 与 SHA-1 形状的 project 稳定，两个 session 头 `x-opencode-session` 和 `x-opencode-session-id` 一致。每个新客户端请求生成新的本地 request ID，内部重试复用，并通过 `x-request-id` 返回；旧的 `x-opencode-request` 头不再发送到上游。parent session、缓存亲和头和已有版本池在保存与热重载时保留。
 
 ### 强制思考强度
 
@@ -269,7 +276,7 @@ direct
 | --------------------------------------- | ------ | ------------------------------------------------------------------------ |
 | `retry.max_attempts`                    | `3`    | 每个通道的尝试次数，包含首次请求；仅匿名 429 可回退到一个首选 Key Tier。 |
 | `retry.timeout_seconds`                 | `300`  | 推理请求总超时，包含流式响应读取。                                       |
-| `performance.attempt_timeout_seconds`   | `0`    | 每次尝试等待响应头的超时；0 表示使用请求总超时。                         |
+| `performance.attempt_timeout_seconds`   | `0`    | 单次尝试从连接、写请求、响应头到可选首事件的超时；0 表示使用请求总超时。 |
 | `performance.connect_timeout_seconds`   | `5`    | 建立连接的超时。                                                         |
 | `performance.failure_cooldown_seconds`  | `15`   | 失败冷却基数。                                                           |
 | `performance.max_idle_conns`            | `2048` | 每个代理 Transport 的空闲连接上限。                                      |
@@ -277,7 +284,7 @@ direct
 | `performance.max_conns_per_host`        | `0`    | 单个主机的连接上限；0 表示不限制。                                       |
 | `performance.idle_conn_timeout_seconds` | `120`  | 空闲连接保留时间。                                                       |
 
-单次响应头超时不会超过请求总超时。希望慢节点仍能留出回退时间时，可以将它设为小于总超时的值。请求上下文过期后会停止后续尝试，不会惩罚尚未实际使用的 Key 或代理。
+单次尝试超时不会超过请求总超时，交付响应后解除，不会截断已建立的流。System One 也遵守该超时，但不等待 SSE 首事件。希望慢节点仍留出回退时间时，可将它设为小于总超时的值。请求上下文过期后停止后续尝试，不惩罚尚未实际使用的 Key 或代理。
 
 ### 日志与管理端
 
@@ -345,7 +352,7 @@ Key、代理、上游地址、重试、模型、日志和路由偏好立即对�
 
 上游**尝试记录**统计的是收到响应头为止的 HTTP 交互，其成功状态和耗时与完整 JSON 响应或流的最终完成情况分开计算。
 
-Token 统计仅使用上游报告的 usage。输入 Token 包含缓存读取和写入，缓存 Token 单独统计缓存读取量。缺失 usage 时不估算 Token，覆盖率表示已经建立路由的推理请求中有多少报告了 usage。
+Token 统计仅使用上游报告的 usage。输入 Token 包含缓存读取和写入，缓存 Token 单独统计缓存读取量。缺失 usage 时不估算 Token，覆盖率表示已经建立路由的推理请求中有多少报告了 usage。`usage.server_keys` 按调用方认证所用的本地 server key（指纹，与 `/api/api-keys` 的 ID 一致）拆分请求数和 Token；Playground 流量计入 `playground`。
 
 | 数据                                            | 保存位置或保留规则                                                        |
 | ----------------------------------------------- | ------------------------------------------------------------------------- |
@@ -410,16 +417,13 @@ go build -o opencode2api ./cmd/opencode2api
 
 开发时可以直接运行 `go run ./cmd/opencode2api -config config.json`。发布构建仍通过 `-ldflags "-X main.version=vX.Y.Z"` 注入版本号。
 
-Node.js 仅用于开发时的格式化和 JavaScript 语法检查：
+Node.js 仅用于 WebUI 的 JavaScript 语法检查：
 
 ```bash
-npm ci --ignore-scripts
-npm run format
-npm run format:check
-npm run check:web
+node --check webui/app.js
 ```
 
-项目通过 `.editorconfig`、`.gitattributes`、Go 格式化和固定版本的 Prettier 统一格式。CI 覆盖 Linux / Windows 上的 Go 1.24 与稳定版 Go 的 `go vet` 和构建，以及格式、WebUI 语法和容器入口脚本语法检查。发布压缩包包含中英文两份 README。
+项目通过 `.editorconfig`、`.gitattributes` 和 Go 格式化统一格式。CI 覆盖 Linux / Windows 上的 Go 1.24 与稳定版 Go 的 `go vet` 和构建，以及 Go 格式、WebUI 语法和容器入口脚本语法检查。发布压缩包包含中英文两份 README。
 
 ## 常见问题
 
@@ -437,6 +441,14 @@ npm run check:web
 ## 致谢
 
 感谢 [LINUX DO](https://linux.do) 社区的支持。
+
+### 自适应思考强度
+
+将 `reasoning.effort` 或按模型覆盖值设置为 `auto`，即可使用免费模型探测实际验证过的最高可用档。已有具体档位语义不变，客户端显式指定的强度始终优先，不维护模型名称白名单。
+
+基础请求成功后，对能力目录标记支持 reasoning 的模型依次验证 `max`、`xhigh`、`high`、`medium`、`low`、`minimal`。只有明确的思考参数不支持错误才尝试下一档；429、超时等临时失败会停止搜索，不能据此判断模型档位上限。全部档位均被拒绝时，不注入思考覆盖。
+
+结果按上游 URL、模型与原生协议持久化，在可用性页展示，最多使用两小时内的验证结果。主动探测仍只覆盖免费 Zen/匿名模型；Go/付费模型、能力未知或尚未验证的模型不猜测档位。开启 `auto` 不扩大探测范围，也不能证明上游一定执行了所有接受的字段；每个模型可能增加数次简短请求并消耗上游额度。
 
 ## 许可证
 

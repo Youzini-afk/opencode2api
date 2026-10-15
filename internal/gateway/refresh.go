@@ -84,8 +84,11 @@ func (g *Gateway) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
 	}
 	zenMoved = g.zenNodes.RestoreProxy(proxy.index)
 	goMoved = g.goNodes.RestoreProxy(proxy.index)
-	if zenMoved+goMoved > 0 {
-		g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", config.RedactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+	// The anonymous lane carries its own per-proxy cooldowns; key recovery
+	// alone would leave it skipped after an outage-era failure.
+	anonCleared := g.anonymous.RestoreProxy(proxy)
+	if zenMoved+goMoved > 0 || anonCleared > 0 {
+		g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", config.RedactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "anonymous_cleared", anonCleared)
 	}
 	return zenMoved, goMoved
 }
@@ -209,7 +212,7 @@ func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog
 
 func (g *Gateway) refreshZen(ctx context.Context, requestID string) []string {
 	if g.anonymous.Len() > 0 {
-		models, status := g.refreshAnonymousTier(ctx, g.cfg.Upstream.Zen, requestID)
+		models, status := g.refreshAnonymousTier(ctx, g.cfg.Upstream.Anonymous, requestID)
 		if models != nil {
 			return models
 		}
@@ -237,7 +240,12 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base, requestID stri
 			}
 		}
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		models, status, err := modelcatalog.FetchModels(refreshCtx, node.proxy.client, base, "", ids)
+		models, status, err := modelcatalog.FetchModels(refreshCtx, node.proxy.client, base, anonymousCredential(base), ids)
+		if err != nil && status == http.StatusNotFound && strings.TrimRight(base, "/") != strings.TrimRight(g.cfg.Upstream.Zen, "/") {
+			// The inference backend may have no directory. Query the configured
+			// Zen console, never an unrelated hard-coded host for a custom relay.
+			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.client, g.cfg.Upstream.Zen, anonymousCredential(g.cfg.Upstream.Zen), ids)
+		}
 		g.syncProxyResult(refreshCtx, node.proxy, status, err)
 		cancel()
 		lastStatus = status

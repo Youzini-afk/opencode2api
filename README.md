@@ -136,7 +136,7 @@ For streaming, add `"stream": true` to the body and use `curl -N`. Responses inc
 curl http://localhost:8080/v1/systemone \
   -H "Authorization: Bearer YOUR_LOCAL_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"MODEL_ID","state":"...","questions":[...]}'
+  -d '{"model":"MODEL_ID","state":"1 + 1 = 2","questions":{"arithmetic":{"type":"noul","instructions":"Is 1 + 1 equal to 2?"}}}'
 ```
 
 System One pairs a free-form state with typed questions and returns typed answers, so the payload shares no shape with the chat/responses bridge and is relayed verbatim, never translated. Only models whose native protocol is System One are served here; a decision payload submitted on a message endpoint (`/v1/chat/completions`, `/v1/responses`) is likewise relayed verbatim instead of converted. Streaming upstream replies are relayed as-is without reset recovery.
@@ -170,19 +170,23 @@ Protocol values are `chat`, `responses`, `anthropic`, and `systemone`. Discovere
 
 Cost, deprecation, and model limits come from the official [OpenCode metadata endpoint](https://models.opencode.ai/api.json), refreshed every 24 hours. OpenCode's capability catalog remains authoritative for context and token limits; metadata `limit.context`, `limit.input`, and `limit.output` fill fields missing from that catalog. These limits are exposed by `/v1/models` as `context_window`/`context_length`, `max_input`, and `max_output` for discovery clients such as CLIProxyAPI and Pi. Metadata requests use a 30-second timeout per HTTP client. Refresh failures retain existing data.
 
+Each `/v1/models` entry also carries `cost` (USD per million tokens: `input`, `output`, `cache_read`, `cache_write`, plus OpenClaw's `cacheRead`/`cacheWrite`) when the metadata states a price. Reasoning models list their levels in `reasoning_efforts` and in OpenClaw's `compat.supportedReasoningEfforts`: `minimal` through `max`, capped at the probed ceiling when the model's effort is `auto`. A forced or probed level is reported as `default_reasoning_effort`. Cache prices appear after the next metadata refresh.
+
 ### Anonymous access and fallback
 
-No Zen key automatically enables true keyless Zen, with no Authorization or x-api-key header. With configured keys, `anonymous: true` explicitly prefers anonymous Zen. Models are never hidden or pre-rejected by price, free-name suffix, provider, Gemini name or probe status; the upstream decides access.
+No Zen key automatically enables anonymous access without a personal API key. The official anonymous backend uses the public `public` marker; custom relays receive no authentication header by default. With configured keys, `anonymous: true` explicitly prefers anonymous access. By default models are never hidden or pre-rejected by price, free-name suffix, provider, Gemini name or probe status; the upstream decides access. `models.free_only: true` is an explicit opt-in to restrict both discovery and routing to models classified as free.
 
 Anonymous requests use the configured retry budget for transport failures, 5xx and 429. Anonymous 401/403 and other non-429 4xx return immediately. Only an anonymous 429 permits fallback to one authenticated tier selected by `prefer`. Ordinary keyed requests stay in their preferred tier and rotate keys within that tier.
 
 Requests are encoded separately for each actual target protocol. Optional `performance.first_event_timeout_seconds` allows retry before the first complete SSE data event. Once output is committed downstream it is never replayed. Recognized stale Responses reasoning references can trigger one repair pass with the same request identity; selected-key diagnostics never use that replay.
 
-`upstream.agent_shaping` is off by default. Enable it for upstreams requiring agent-shaped requests: it forces upstream streaming and adds missing core tool definitions; non-streaming clients receive a collapsed JSON response. Enable only when this payload transformation is desired.
+Official OpenCode endpoints automatically use the current CLI request shape: upstream streaming and official core tool schemas, replacing recognized same-name tool schemas when required by the gate. Non-streaming clients still receive a collapsed JSON response. Custom relays remain transparent unless `upstream.agent_shaping` is explicitly enabled. `upstream.anonymous` selects the anonymous inference URL; when omitted, official Zen upgrades to `https://opencode.ai/inference`, while a custom Zen URL is reused. A missing directory on the inference backend falls back to the configured Zen directory.
 
 ### Model availability diagnostics
 
 `models.probe_availability` is off by default. Enabling it sends periodic short inference probes, which can consume upstream allowance. Results are diagnostic only and never hide models or block production inference. Probe state and manual reset remain available through the authenticated WebUI and availability APIs.
+
+Manual control pauses a model's probes; returning to automatic mode schedules a new probe. `reasoning.effort: "auto"` uses recent validated observations only, and does not itself turn probing on. Temporary errors never establish that a model has been retired. `POST /api/models/manual` accepts `{"model":"MODEL_ID","manual":true|false}` with management authentication and CSRF protection.
 
 ### Sessions and proxies
 
@@ -209,16 +213,19 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `prefer`                    | `go`; accepts `go` or `zen`.                                                   |
 | `upstream.zen`              | `https://opencode.ai/zen`.                                                     |
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                                  |
+| `upstream.anonymous`        | Optional; official Zen uses `https://opencode.ai/inference`, custom Zen retains its own URL. |
 | `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.                  |
 | `proxyfile`                 | Optional; relative paths resolve beside the configuration file.                |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                              |
 | `models.protocols`          | `{}`; per-model native protocol overrides.                                     |
-| `reasoning.effort`          | Empty (off); `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `none`.    |
+| `models.free_only`          | `false`; opt-in free-model filtering for discovery and inference. |
+| `models.probe_availability` | `false`; optional diagnostic inference probes. |
+| `reasoning.effort`          | Empty (off); `auto`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `none`. |
 | `reasoning.effort_by_model` | `{}`; per-model overrides of `reasoning.effort`.                               |
 
 ### Session-stable CLI fingerprints
 
-`fingerprint.versions` is a configurable pool of OpenCode CLI versions. A deterministic rendezvous hash selects a version per conversation. User-Agent is strictly `opencode/<version>`; the session and SHA-1-shaped project stay stable, while each client request has a fresh request ID reused across retries. Canonical OpenCode session IDs and parent-session affinity are supported. Existing version pools persist through configuration edits and reloads.
+`fingerprint.versions` is a configurable pool of OpenCode CLI versions. A deterministic rendezvous hash selects a version per conversation. User-Agent is `opencode/latest/<version>/cli`; the descending-encoded session and SHA-1-shaped project stay stable. Both `x-opencode-session` and `x-opencode-session-id` carry that session. Each client request still has a fresh local trace ID reused across retries and returned as `x-request-id`; the obsolete `x-opencode-request` header is not sent upstream. Parent-session affinity and existing version pools persist through configuration edits and reloads.
 
 ### Forced thinking level
 
@@ -274,7 +281,7 @@ Comment markers are `#`, `;`, and `//` at the start of a line or after whitespac
 | --------------------------------------- | ------- | ------------------------------------------------------------------------------------------------- |
 | `retry.max_attempts`                    | `3`     | Attempts per channel, including the first; only anonymous 429 permits one preferred key fallback. |
 | `retry.timeout_seconds`                 | `300`   | Total inference timeout, including stream consumption.                                            |
-| `performance.attempt_timeout_seconds`   | `0`     | Header wait per attempt; 0 uses the request timeout.                                              |
+| `performance.attempt_timeout_seconds`   | `0`     | Per-attempt dial, write, headers and optional first-event deadline; 0 uses the request timeout. |
 | `performance.connect_timeout_seconds`   | `5`     | Connection establishment timeout.                                                                 |
 | `performance.failure_cooldown_seconds`  | `15`    | Base failure cooldown.                                                                            |
 | `performance.max_idle_conns`            | `2048`  | Idle connection limit per proxy transport.                                                        |
@@ -282,7 +289,7 @@ Comment markers are `#`, `;`, and `//` at the start of a line or after whitespac
 | `performance.max_conns_per_host`        | `0`     | Connection limit per host; 0 is unlimited.                                                        |
 | `performance.idle_conn_timeout_seconds` | `120`   | Idle connection lifetime.                                                                         |
 
-The per-attempt header timeout is capped by the request timeout. Set it below the total timeout if a slow upstream should leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or proxies.
+The per-attempt deadline is capped by the request timeout and disarmed once the response is released, so it cannot cut an established stream. It also applies to System One (without an SSE first-event wait). Set it below the total timeout to leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or proxies.
 
 ### Logging and management
 
@@ -350,7 +357,7 @@ Request outcomes describe the completed inference. A failed SSE response or trun
 
 Upstream **attempt** records measure the HTTP exchange through receipt of response headers. Their success and latency are separate from completion of the full JSON body or stream.
 
-Token statistics use reported usage only. Input tokens include cache reads and writes; cached tokens separately count cache reads. Missing usage is not estimated, and coverage shows how many routed inference requests reported usage.
+Token statistics use reported usage only. Input tokens include cache reads and writes; cached tokens separately count cache reads. Missing usage is not estimated, and coverage shows how many routed inference requests reported usage. `usage.server_keys` splits requests and tokens by the local server key the caller authenticated with (its fingerprint, as shown in `/api/api-keys`); Playground traffic is counted under `playground`.
 
 | Data                                                      | Storage / retention                                                                          |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
@@ -415,16 +422,13 @@ go build -o opencode2api ./cmd/opencode2api
 
 For local development, start the service with `go run ./cmd/opencode2api -config config.json`. Release builds still inject the version with `-ldflags "-X main.version=vX.Y.Z"`.
 
-Node.js is only needed for development formatting and JavaScript syntax checks:
+Node.js is only needed for the WebUI JavaScript syntax check:
 
 ```bash
-npm ci --ignore-scripts
-npm run format
-npm run format:check
-npm run check:web
+node --check webui/app.js
 ```
 
-`.editorconfig`, `.gitattributes`, Go formatting, and pinned Prettier settings standardize the source. CI runs `go vet` and builds with Go 1.24 and stable Go on Linux/Windows, plus formatting, WebUI syntax, and entrypoint shell syntax checks. Release archives include both READMEs.
+`.editorconfig`, `.gitattributes`, and Go formatting standardize the source. CI runs `go vet` and builds with Go 1.24 and stable Go on Linux/Windows, plus Go formatting, WebUI syntax, and entrypoint shell syntax checks. Release archives include both READMEs.
 
 ## Troubleshooting
 
@@ -442,6 +446,14 @@ npm run check:web
 ## Acknowledgements
 
 Thanks to the [LINUX DO](https://linux.do) community for its support.
+
+### Adaptive reasoning effort
+
+Set `reasoning.effort` (or a per-model override) to `auto` to use the highest effort successfully validated by the free-model probe. Existing concrete levels retain their meaning and client-specified effort takes precedence. No model-name allowlist is maintained.
+
+After a baseline succeeds, reasoning-capable models are probed in `max`, `xhigh`, `high`, `medium`, `low`, `minimal` order. Only an explicit reasoning-parameter rejection advances to a lower level. Transient failures stop the search and cannot be interpreted as a lower capability ceiling. If every level is rejected, no reasoning override is injected.
+
+Observations are persisted by upstream URL, model and native protocol, displayed in the availability page, and used for at most two hours. Active probes cover only free Zen/anonymous models; Go/paid models, unknown capabilities and unverified levels receive no automatic override. Setting `auto` does not expand the probe scope or guarantee that upstreams enforce every accepted field. Probing may require several small requests per model and uses upstream allowance.
 
 ## License
 

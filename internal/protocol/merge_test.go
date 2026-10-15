@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"opencode2api/internal/jsonutil"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -39,6 +40,36 @@ func TestAnthropicThinkingUsesAdaptiveModeWhenManualBudgetWouldBeInvalid(t *test
 	}
 	if got := jsonutil.StringAt(converted, "thinking", "type"); got != "adaptive" {
 		t.Fatalf("invalid manual budget was preserved: %#v", converted["thinking"])
+	}
+}
+
+func TestToolResultImagesSurviveCrossProtocolConversion(t *testing.T) {
+	var source map[string]any
+	if err := json.Unmarshal([]byte(`{"model":"test","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"screenshot"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]}]}]}`), &source); err != nil {
+		t.Fatal(err)
+	}
+	before := jsonutil.CloneMap(source)
+	responses, err := PrepareRequest(Anthropic, Responses, source, "https://example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := jsonutil.SliceAt(responses, "input")
+	result, _ := items[len(items)-1].(map[string]any)
+	output := jsonutil.SliceAt(result, "output")
+	image, _ := output[1].(map[string]any)
+	if result["call_id"] != "call_1" || image["type"] != "input_image" || image["image_url"] != "data:image/png;base64,aW1hZ2U=" {
+		t.Fatalf("Responses lost the tool image or call ID: %v", responses)
+	}
+	chat, err := PrepareRequest(Anthropic, Chat, source, "https://example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(chat)
+	if !strings.Contains(string(encoded), "tool_image call_id=") || !strings.Contains(string(encoded), "data:image/png;base64,aW1hZ2U=") {
+		t.Fatalf("Chat lost the image or its tool association: %s", encoded)
+	}
+	if !reflect.DeepEqual(source, before) {
+		t.Fatal("conversion mutated the caller's tool result")
 	}
 }
 

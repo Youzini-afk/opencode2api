@@ -9,7 +9,8 @@
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go",
-    "agent_shaping": false
+    "agent_shaping": false,
+    "anonymous": "https://opencode.ai/inference"
   },
   "fingerprint": {
     "versions": [
@@ -34,7 +35,8 @@
   "models": {
     "refresh_seconds": 300,
     "protocols": {},
-    "probe_availability": false
+    "probe_availability": false,
+    "free_only": false
   },
   "performance": {
     "max_idle_conns": 2048,

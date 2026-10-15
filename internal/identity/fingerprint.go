@@ -38,11 +38,11 @@ func internalKeySignal(value string) string {
 }
 
 func userAgentForSession(session string, versions []string) string {
-	return "opencode/" + rendezvousVersion(session, versions)
+	return "opencode/latest/" + rendezvousVersion(session, versions) + "/cli"
 }
 
 func defaultOpenCodeUserAgent() string {
-	return "opencode/" + defaultOpenCodeVersion
+	return "opencode/latest/" + defaultOpenCodeVersion + "/cli"
 }
 
 // rendezvousVersion uses highest-random-weight hashing so adding or removing a
@@ -69,7 +69,9 @@ func SetHeaders(req *http.Request, ids RequestIDs) {
 	req.Header.Set("User-Agent", ids.UserAgent)
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", ids.Session)
-	req.Header.Set("x-opencode-request", ids.Request)
+	req.Header.Set("x-opencode-session-id", ids.Session)
+	// Request is a fresh local trace ID, not a current OpenCode wire header.
+	req.Header.Del("x-opencode-request")
 	req.Header.Set("x-opencode-project", ids.Project)
 	req.Header.Set("x-session-affinity", ids.Session)
 	req.Header.Set("X-Session-Id", ids.Session)

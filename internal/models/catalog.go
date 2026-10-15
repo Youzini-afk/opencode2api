@@ -66,6 +66,7 @@ type Catalog struct {
 	cacheSource     string
 	stale           bool
 	refreshAfter    time.Duration
+	freeOnly        bool
 }
 
 type CatalogSnapshot struct {
@@ -131,6 +132,23 @@ func (c *Catalog) SetRefreshInterval(interval time.Duration) {
 	c.mu.Lock()
 	c.refreshAfter = interval
 	c.mu.Unlock()
+}
+
+// SetFreeOnly hides every model that is not free from discovery and routing.
+func (c *Catalog) SetFreeOnly(enabled bool) {
+	c.mu.Lock()
+	c.freeOnly = enabled
+	c.mu.Unlock()
+}
+
+// freeOnlyErrorLocked rejects paid models while models.free_only is set. Both
+// routing entry points check it, so /v1/models, inference, rotation aliases and
+// diagnostics agree on what is exposed.
+func (c *Catalog) freeOnlyErrorLocked(model string) error {
+	if c.freeOnly && !c.freeModelLocked(model) {
+		return fmt.Errorf("model %q is not free and models.free_only is enabled", model)
+	}
+	return nil
 }
 
 func (c *Catalog) Replace(zen, goModels []string) {
@@ -210,6 +228,9 @@ func (c *Catalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) 
 }
 
 func (c *Catalog) routeLocked(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (Route, error) {
+	if err := c.freeOnlyErrorLocked(model); err != nil {
+		return Route{}, err
+	}
 	keyTiers := c.keyTierOrderLocked(model, hasZenKeys, hasGoKeys)
 	// Anonymous access is Zen-only and does not consult local pricing guesses.
 	// Explicit anonymous mode prefers it for models actually advertised on Zen;
@@ -317,6 +338,9 @@ func (c *Catalog) RouteForTier(model string, tier config.Tier, hasZenKeys, hasGo
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
+	if err := c.freeOnlyErrorLocked(model); err != nil {
+		return Route{}, err
+	}
 	advertised := c.zen[model]
 	if tier == config.TierGo {
 		advertised = c.goModels[model]
@@ -351,6 +375,10 @@ func (c *Catalog) anonymousDecision(model string) AnonymousDecision {
 func (c *Catalog) IsFreeModel(model string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.freeModelLocked(model)
+}
+
+func (c *Catalog) freeModelLocked(model string) bool {
 	if c.pricing != nil {
 		return c.pricing.Decide(model).Allowed
 	}
@@ -435,6 +463,9 @@ func (c *Catalog) AvailableModels(hasZenKeys, hasGoKeys, hasAnonymous bool) ([]R
 	ids := c.modelIDsLocked()
 	routes := make([]Route, 0, len(ids))
 	for _, model := range ids {
+		if c.freeOnlyErrorLocked(model) != nil {
+			continue
+		}
 		if route, err := c.routeLocked(model, hasZenKeys, hasGoKeys, hasAnonymous); err == nil {
 			routes = append(routes, route)
 		} else {
@@ -455,7 +486,7 @@ func (c *Catalog) AvailableModels(hasZenKeys, hasGoKeys, hasAnonymous bool) ([]R
 func (c *Catalog) snapshotLocked(ids []string) CatalogSnapshot {
 	exposed := 0
 	for _, model := range ids {
-		if c.supportedLocked(model) {
+		if c.supportedLocked(model) && c.freeOnlyErrorLocked(model) == nil {
 			exposed++
 		}
 	}
@@ -506,6 +537,9 @@ func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 	}
 	if md.MaxOutput == 0 {
 		md.MaxOutput = price.MaxOutput
+	}
+	if price.Input != nil || price.Output != nil {
+		md.Cost = &Cost{Input: price.Input, Output: price.Output, CacheRead: price.CacheRead, CacheWrite: price.CacheWrite}
 	}
 	return md
 }

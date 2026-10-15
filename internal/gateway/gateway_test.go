@@ -314,8 +314,13 @@ func TestInferenceIdentityIsStableAcrossRetryAndSession(t *testing.T) {
 			t.Fatalf("same session changed %s: %q != %q", name, captured[2].Get(name), captured[0].Get(name))
 		}
 	}
-	if captured[2].Get("x-opencode-request") == captured[0].Get("x-opencode-request") {
-		t.Fatalf("new inference reused x-opencode-request %q", captured[2].Get("x-opencode-request"))
+	if firstRecorder.Header().Get("x-request-id") == "" || firstRecorder.Header().Get("x-request-id") == secondRecorder.Header().Get("x-request-id") {
+		t.Fatal("new inference reused the local request ID")
+	}
+	for _, headers := range captured {
+		if headers.Get("x-opencode-request") != "" {
+			t.Fatal("legacy request header reached upstream")
+		}
 	}
 }
 
@@ -339,8 +344,8 @@ func TestModelRefreshRetryUsesCompleteStableAnonymousIdentity(t *testing.T) {
 		t.Fatalf("refresh models = %#v, attempts = %d", models, len(captured))
 	}
 	assertOpenCodeIdentityHeadersEqual(t, captured[0], captured[1])
-	if got := captured[0].Get("x-opencode-request"); got != "req_refresh_round" {
-		t.Fatalf("refresh request ID = %q", got)
+	if got := captured[0].Get("x-opencode-request"); got != "" {
+		t.Fatalf("local refresh trace leaked to the wire: %q", got)
 	}
 	if got := captured[0].Get("Authorization"); got != "" {
 		t.Fatalf("anonymous refresh sent Authorization = %q", got)
@@ -352,7 +357,7 @@ func TestModelRefreshRetryUsesCompleteStableAnonymousIdentity(t *testing.T) {
 	}
 }
 
-func TestParallelModelRefreshUsesDistinctRequestIDs(t *testing.T) {
+func TestParallelModelRefreshUsesDistinctTierSessions(t *testing.T) {
 	type capturedRequest struct {
 		tier      config.Tier
 		requestID string
@@ -360,7 +365,7 @@ func TestParallelModelRefreshUsesDistinctRequestIDs(t *testing.T) {
 	captured := make(chan capturedRequest, 2)
 	server := func(tier config.Tier) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			captured <- capturedRequest{tier: tier, requestID: r.Header.Get("x-opencode-request")}
+			captured <- capturedRequest{tier: tier, requestID: r.Header.Get("x-opencode-session-id")}
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"data": []map[string]string{{"id": string(tier) + "-model"}}})
 		}))
 	}
@@ -389,10 +394,10 @@ func TestParallelModelRefreshUsesDistinctRequestIDs(t *testing.T) {
 	}
 	cancel()
 	if requestIDs[config.TierZen] == "" || requestIDs[config.TierGo] == "" {
-		t.Fatalf("parallel refresh omitted request ID: %#v", requestIDs)
+		t.Fatalf("parallel refresh omitted session ID: %#v", requestIDs)
 	}
 	if requestIDs[config.TierZen] == requestIDs[config.TierGo] {
-		t.Fatalf("independent Zen and Go refreshes shared request ID %q", requestIDs[config.TierZen])
+		t.Fatalf("independent Zen and Go refreshes shared session ID %q", requestIDs[config.TierZen])
 	}
 }
 
@@ -435,7 +440,7 @@ func TestProxyHealthCheckUsesLegalDefaultUserAgent(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("health check error = %v", result.err)
 	}
-	if userAgent != "opencode/1.18.18" {
+	if userAgent != httpx.UserAgent() || !strings.HasPrefix(userAgent, "opencode/latest/") || !strings.HasSuffix(userAgent, "/cli") {
 		t.Fatalf("health check User-Agent = %q", userAgent)
 	}
 }
@@ -444,18 +449,18 @@ var openCodeIdentityHeaderNames = []string{
 	"User-Agent",
 	"x-opencode-client",
 	"x-opencode-session",
-	"x-opencode-request",
+	"x-opencode-session-id",
 	"x-opencode-project",
 }
 
 func assertOpenCodeHeaders(t *testing.T, headers http.Header, want identity.RequestIDs) {
 	t.Helper()
 	wantValues := map[string]string{
-		"User-Agent":         want.UserAgent,
-		"x-opencode-client":  "cli",
-		"x-opencode-session": want.Session,
-		"x-opencode-request": want.Request,
-		"x-opencode-project": want.Project,
+		"User-Agent":            want.UserAgent,
+		"x-opencode-client":     "cli",
+		"x-opencode-session":    want.Session,
+		"x-opencode-session-id": want.Session,
+		"x-opencode-project":    want.Project,
 	}
 	for name, value := range wantValues {
 		if got := headers.Get(name); got != value {

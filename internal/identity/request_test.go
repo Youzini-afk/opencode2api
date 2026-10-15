@@ -29,8 +29,13 @@ func TestRequestIdentityIsStablePerSessionAndFreshPerRequest(t *testing.T) {
 	if first.Session == other.Session || first.Project == other.Project {
 		t.Fatalf("different sessions shared identity: first=%#v other=%#v", first, other)
 	}
-	if !canonicalSessionPattern.MatchString(first.Session) {
+	if !canonicalSessionPattern.MatchString(first.Session) || !descendingTimePartPattern.MatchString(first.Session[4:16]) {
 		t.Fatalf("session is not in canonical OpenCode format: %q", first.Session)
+	}
+	legacy := "ses_0123456789ab0123456789ABcd"
+	migrated := CanonicalSessionID(legacy)
+	if migrated == legacy || migrated != CanonicalSessionID(legacy) || !descendingTimePartPattern.MatchString(migrated[4:16]) {
+		t.Fatalf("legacy hash-shaped session was not stably migrated: %q", migrated)
 	}
 	canonical := DeriveRequestIDs(request(first.Session), body, defaultOpenCodeVersions)
 	if canonical.Session != first.Session {
@@ -111,7 +116,7 @@ func TestDefaultOpenCodeVersions(t *testing.T) {
 	if !slices.Equal(defaultOpenCodeVersions, want) {
 		t.Fatalf("default fingerprint versions = %#v, want %#v", defaultOpenCodeVersions, want)
 	}
-	if got := defaultOpenCodeUserAgent(); got != "opencode/1.18.18" {
+	if got := defaultOpenCodeUserAgent(); got != "opencode/latest/1.18.18/cli" {
 		t.Fatalf("default User-Agent = %q", got)
 	}
 }
